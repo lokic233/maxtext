@@ -69,10 +69,6 @@ class TestLoadStateIfPossibleNNX(unittest.TestCase):
         checkpoint_manager,
         14,
         abstract_nnx_state,
-        lambda leaf: ocp.type_handlers.ArrayRestoreArgs(
-            global_shape=leaf.shape,
-            dtype=leaf.dtype,
-        ),
     )
 
     checkpoint_manager.restore.assert_called_once()

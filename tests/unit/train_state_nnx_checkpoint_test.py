@@ -73,8 +73,8 @@ class TestEmergencyReplicatorCheckpointManager(unittest.TestCase):
     mesh = object()
 
     with mock.patch.object(
-        checkpointing,
-        "EmergencyReplicatorCheckpointManager",
+        checkpointing.emergency_checkpointing,
+        "ReplicatorCheckpointManager",
         return_value=checkpoint_manager,
     ) as manager_cls:
       result = checkpointing.create_orbax_emergency_replicator_checkpoint_manager(
@@ -387,7 +387,7 @@ class TestMaybeSaveCheckpointStepAlignment(unittest.TestCase):
         enable_diloco=False,
     )
     mgr = mock.MagicMock()
-    mgr.reached_preemption.return_value = False
+    mgr.latest = None  # no existing checkpoint -> _latest_step() is None, so the save proceeds
 
     captured = {}
 
@@ -396,7 +396,10 @@ class TestMaybeSaveCheckpointStepAlignment(unittest.TestCase):
       captured["state"] = state_arg
       return False  # no save happened => print_save_message is skipped
 
-    with mock.patch.object(checkpointing, "save_checkpoint", side_effect=fake_save_checkpoint):
+    with (
+        mock.patch.object(checkpointing, "save_checkpoint", side_effect=fake_save_checkpoint),
+        mock.patch.object(checkpointing.multihost_utils, "reached_preemption_sync_point", return_value=False),
+    ):
       checkpointing.maybe_save_checkpoint(mgr, state, config, data_iterator=None, step=None)
     return captured
 
@@ -458,13 +461,15 @@ class TestMaybeSaveCheckpointStepAlignment(unittest.TestCase):
         enable_diloco=False,
     )
     mgr = mock.MagicMock()
-    mgr.reached_preemption.return_value = False
-    # Mock latest_step to return the same actual_step
-    mgr.latest_step.return_value = actual_step
+    # Latest saved step matches actual_step -> save should be skipped.
+    mgr.latest = mock.MagicMock(step=actual_step)
 
     save_checkpoint_mock = mock.MagicMock()
 
-    with mock.patch.object(checkpointing, "save_checkpoint", save_checkpoint_mock):
+    with (
+        mock.patch.object(checkpointing, "save_checkpoint", save_checkpoint_mock),
+        mock.patch.object(checkpointing.multihost_utils, "reached_preemption_sync_point", return_value=False),
+    ):
       checkpointing.maybe_save_checkpoint(mgr, state, config, data_iterator=None, step=None)
 
     # Assert that save_checkpoint was NOT called!
@@ -482,14 +487,16 @@ class TestMaybeSaveCheckpointStepAlignment(unittest.TestCase):
         enable_diloco=False,
     )
     mgr = mock.MagicMock()
-    mgr.reached_preemption.return_value = False
-    # Mock latest_step to return a different step (or None)
-    mgr.latest_step.return_value = actual_step - 1
+    # Latest saved step differs from actual_step -> save should happen.
+    mgr.latest = mock.MagicMock(step=actual_step - 1)
 
     save_checkpoint_mock = mock.MagicMock()
     save_checkpoint_mock.return_value = False
 
-    with mock.patch.object(checkpointing, "save_checkpoint", save_checkpoint_mock):
+    with (
+        mock.patch.object(checkpointing, "save_checkpoint", save_checkpoint_mock),
+        mock.patch.object(checkpointing.multihost_utils, "reached_preemption_sync_point", return_value=False),
+    ):
       checkpointing.maybe_save_checkpoint(mgr, state, config, data_iterator=None, step=None)
 
     # Assert that save_checkpoint WAS called!
