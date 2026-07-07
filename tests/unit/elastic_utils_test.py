@@ -14,10 +14,14 @@
 
 """Unit tests for Elastic Training utility functions."""
 
+import datetime
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 from unittest.mock import create_autospec, Mock
 
 
+from maxtext.trainers.pre_train import train
 from maxtext.utils import elastic_utils
 from maxtext.utils import gcs_utils
 import pathwaysutils
@@ -91,7 +95,7 @@ class ElasticUtilsTest(unittest.TestCase):
     elastic_utils.gcs_utils = self.original_gcs_utils
     elastic_utils.max_logging = self.original_max_logging
     pathwaysutils.elastic.manager.Manager = self.original_manager_class
-    pathwaysutils.elastic.manager.ScaleUpSignalError = ( # pyrefly: ignore[bad-assignment]
+    pathwaysutils.elastic.manager.ScaleUpSignalError = (  # pyrefly: ignore[bad-assignment]
         self.original_scale_up_signal_error,
     )
     elastic_utils.elastic_manager = None
@@ -320,6 +324,70 @@ class ElasticUtilsTest(unittest.TestCase):
       elastic_utils.maybe_elastic_scale_up(config, cm)
 
     self.assertTrue(cm.wait_called)
+
+  def test_training_loop_scale_up_exits_before_step_work(self):
+    """Scale-up signals should be handled before data, train, or checkpoint work."""
+    state = object()
+    checkpoint_manager = object()
+    config = SimpleNamespace(elastic_enabled=True)
+    data_loader = mock.Mock()
+    p_train_step = mock.Mock()
+    prof = mock.Mock()
+    jax_device_state = {
+        "state": state,
+        "init_rng": object(),
+        "mesh": object(),
+        "state_mesh_shardings": object(),
+        "p_train_step": p_train_step,
+        "p_eval_step": object(),
+        "model": object(),
+    }
+    python_vars = {
+        "step": 7,
+        "last_step_completion": datetime.datetime.now(),
+        "data_loader": data_loader,
+        "rampup_manager": object(),
+        "recorder": None,
+        "checkpoint_manager": checkpoint_manager,
+        "data_iterator": object(),
+        "eval_data_iterator": None,
+        "metric_logger_instance": object(),
+        "prof": prof,
+    }
+    immutable_data = {
+        "config": config,
+        "logical_axis_rules": object(),
+        "shard_optimizer_over_data": False,
+        "shard_mode": object(),
+        "eval_interval": 0,
+        "eval_steps": 0,
+        "start_step": 0,
+        "dump_hlo": False,
+        "dump_step": 0,
+        "dump_hlo_local_dir": "",
+        "dump_hlo_gcs_dir": "",
+        "dump_hlo_module_name": "",
+        "dump_hlo_delete_local_after": False,
+        "dump_hlo_upload_all": False,
+    }
+    scale_up_error = train.elastic_utils.manager.ScaleUpSignalError
+
+    with (
+        mock.patch.object(
+            train.elastic_utils,
+            "maybe_elastic_scale_up",
+            side_effect=scale_up_error(),
+        ) as mock_scale_up,
+        mock.patch.object(train.checkpointing, "maybe_save_checkpoint") as mock_maybe_save_checkpoint,
+    ):
+      with self.assertRaises(scale_up_error):
+        train.training_loop_iteration(jax_device_state, python_vars, immutable_data)
+
+    prof.maybe_activate_profiler.assert_called_once_with(7, state)
+    mock_scale_up.assert_called_once_with(config, checkpoint_manager)
+    data_loader.load_next_batch.assert_not_called()
+    p_train_step.assert_not_called()
+    mock_maybe_save_checkpoint.assert_not_called()
 
   def test_elastic_retry_default_min_slices(self):
     """Tests that elastic_retry passes None when elastic_min_slice_count is -1."""
