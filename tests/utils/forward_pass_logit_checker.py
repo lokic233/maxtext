@@ -44,7 +44,7 @@ Note: For multimodal models, running the HuggingFace model on-the-fly inside thi
 You must pre-generate the HuggingFace golden logits file first using generate_hf_golden_logits.py. For example:
 
 python3 -m tests.assets.logits_generation.generate_hf_golden_logits \
-    --model-id=Qwen/Qwen3-VL-2B-Instruct --hf-model-path=/path/to/hf/qwen3-vl-2b \
+    --model-id=Qwen/Qwen3-VL-2B-Instruct --hf-model-path=<your-bucket>/qwen3-vl-2b \
     --prompts="Describe this image" --image-paths=tests/assets/test_image.jpg \
     --output-path=<your-bucket>/golden_qwen3-vl-2b_vision \
     --apply-chat-template --output-format=json
@@ -56,7 +56,7 @@ python3 -m tests.utils.forward_pass_logit_checker src/maxtext/configs/base.yml \
     load_parameters_path=<your-bucket>/qwen3-vl-2b/maxtext_ckpt/0/items model_name=qwen3-vl-2b \
     use_multimodal=true scan_layers=false dtype=float32 per_device_batch_size=1 override_model_config=true \
     prompt="Describe this image" image_path=tests/assets/test_image.jpg \
-    --max_kl_div=0.1 --golden_logits_path=/path/to/golden_qwen3-vl-2b_vision
+    --max_kl_div=0.1 --golden_logits_path=<your-bucket>/golden_qwen3-vl-2b_vision
 
 2. For text-only models (running HuggingFace model on-the-fly to compare against MaxText):
 
@@ -64,7 +64,7 @@ python3 -m tests.utils.forward_pass_logit_checker src/maxtext/configs/base.yml \
     tokenizer_path=<your-bucket>/qwen3-0.6b \
     load_parameters_path=<your-bucket>/qwen3-0.6b/maxtext_ckpt/0/items model_name=qwen3-0.6b \
     use_multimodal=false per_device_batch_size=1 dtype=float32 override_model_config=true \
-    --max_kl_div=0.1 --run_hf_model=true --hf_model_path=/path/to/local/hf/qwen3-0.6b
+    --max_kl_div=0.1 --run_hf_model=true --hf_model_path=<your-bucket>/qwen3-0.6b
 """
 
 import argparse
