@@ -186,6 +186,7 @@ def main(argv: Sequence[str]) -> None:
           images=processor_outputs.pixel_values if config.use_multimodal else None,
           image_masks=processor_outputs.pixel_mask if config.use_multimodal and "llama4" in config.model_name else None,
           videos=getattr(processor_outputs, "video_values", None) if config.use_multimodal else None,
+          video_masks=getattr(processor_outputs, "video_mask", None) if config.use_multimodal else None,
           audio_values=processor_outputs.audio_values if config.use_audio else None,
           audio_masks=processor_outputs.audio_mask if config.use_audio else None,
           true_length=true_length,
