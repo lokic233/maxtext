@@ -40,39 +40,31 @@ Usage:
 
 1. For multimodal models (comparing MaxText against a pre-generated HF golden logits file):
 
-python3 -m tests.utils.forward_pass_logit_checker \
-    src/maxtext/configs/base.yml \
-    tokenizer_path=<your-bucket>/qwen3-vl-2b \
-    load_parameters_path=<your-bucket>/qwen3-vl-2b/maxtext_ckpt/0/items \
-    model_name=qwen3-vl-2b \
-    use_multimodal=true \
-    scan_layers=false \
-    dtype=float32 \
-    per_device_batch_size=1 \
-    prompt="Describe this image" \
-    image_path=tests/assets/test_image.jpg \
-    --max_kl_div=0.1 \
-    --golden_logits_path=golden_qwen2-vl-7b_vision.jsonl \
-    override_model_config=true
-
 Note: For multimodal models, running the HuggingFace model on-the-fly inside this script is not supported.
-You must pre-generate the HuggingFace golden logits file first using
-tests/assets/logits_generation/generate_hf_golden_logits.py.
+You must pre-generate the HuggingFace golden logits file first using generate_hf_golden_logits.py. For example:
+
+python3 -m tests.assets.logits_generation.generate_hf_golden_logits \
+    --model-id=Qwen/Qwen3-VL-2B-Instruct --hf-model-path=/path/to/hf/qwen3-vl-2b \
+    --prompts="Describe this image" --image-paths=tests/assets/test_image.jpg \
+    --output-path=<your-bucket>/golden_qwen3-vl-2b_vision \
+    --apply-chat-template --output-format=json
+
+Then run the following command to check if the MaxText checkpoint matches the golden logits:
+
+python3 -m tests.utils.forward_pass_logit_checker src/maxtext/configs/base.yml \
+    tokenizer_path=<your-bucket>/qwen3-vl-2b \
+    load_parameters_path=<your-bucket>/qwen3-vl-2b/maxtext_ckpt/0/items model_name=qwen3-vl-2b \
+    use_multimodal=true scan_layers=false dtype=float32 per_device_batch_size=1 override_model_config=true \
+    prompt="Describe this image" image_path=tests/assets/test_image.jpg \
+    --max_kl_div=0.1 --golden_logits_path=/path/to/golden_qwen3-vl-2b_vision
 
 2. For text-only models (running HuggingFace model on-the-fly to compare against MaxText):
 
-python3 -m tests.utils.forward_pass_logit_checker \
-    src/maxtext/configs/base.yml \
-    tokenizer_path=<your-bucket>/gemma-2-2b \
-    load_parameters_path=<your-bucket>/gemma-2-2b/maxtext_ckpt/0/items \
-    model_name=gemma-2-2b \
-    use_multimodal=false \
-    per_device_batch_size=1 \
-    dtype=float32 \
-    --max_kl_div=0.1 \
-    --run_hf_model=true \
-    --hf_model_path=/path/to/local/hf/gemma-2-2b \
-    override_model_config=true
+python3 -m tests.utils.forward_pass_logit_checker src/maxtext/configs/base.yml \
+    tokenizer_path=<your-bucket>/qwen3-0.6b \
+    load_parameters_path=<your-bucket>/qwen3-0.6b/maxtext_ckpt/0/items model_name=qwen3-0.6b \
+    use_multimodal=false per_device_batch_size=1 dtype=float32 override_model_config=true \
+    --max_kl_div=0.1 --run_hf_model=true --hf_model_path=/path/to/local/hf/qwen3-0.6b
 """
 
 import argparse
@@ -260,8 +252,6 @@ def get_data(golden_data_point, config):
       p = config.patch_size_for_vit
       c = config.num_channels_for_vit
       pixel_values = np.reshape(pixel_values, (c, int(grid_t * tps), int(grid_h * p), int(grid_w * p)))
-    else:
-      pixel_values = np.transpose(pixel_values, (1, 2, 0))
     pixel_values = np.stack([pixel_values for _ in range(config.global_batch_size_to_train_on)])
   else:
     pixel_values = None
