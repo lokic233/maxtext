@@ -200,7 +200,7 @@ def check_kl_divergence(model_logits, golden_logits, atol=0.02):
       log_target=False,
   )
 
-  max_logging.log(f"\nAverage KL divergence per token (D_KL(P_golden || Q_model)): {kl_div_value.item():.4e}")
+  max_logging.log(f"\nAverage KL divergence per token (D_KL(P_golden || Q_model)): {kl_div_value.item():.2e}")
 
   # To find the max KL divergence for any single token in the set
   # use reduction='none'.
@@ -211,13 +211,13 @@ def check_kl_divergence(model_logits, golden_logits, atol=0.02):
   )  # Sum over the vocab dim to get a single KL value per token
 
   # Log per-token KL divergences
-  formatted_list = [f"{x:.4e}" for x in kl_divs_per_token.tolist()]
+  formatted_list = [f"{x:.2e}" for x in kl_divs_per_token.tolist()]
   max_logging.log(f"Per-token KL Divergences: \n{formatted_list}")
 
   max_kl_div = kl_divs_per_token.max()
-  max_logging.log(f"\nMax KL divergence for a single token in the set: {max_kl_div.item():.4e}")
+  max_logging.log(f"\nMax KL divergence for a single token in the set: {max_kl_div.item():.2e}")
 
-  assert max_kl_div < atol, f"KL divergence values {max_kl_div.item():.4e} exceed the threshold {atol}"
+  assert max_kl_div < atol, f"KL divergence values {max_kl_div.item():.2e} exceed the threshold {atol}"
 
 
 def get_data(golden_data_point, config):
@@ -275,7 +275,7 @@ def get_data(golden_data_point, config):
     prompt = golden_data_point["formatted_prompt"]
   else:
     prompt = golden_data_point["prompt"]
-  max_logging.log(f' prompt="{prompt}" raw ids={original_ids}, logits.shape = {logits.shape}')
+  max_logging.log(f' prompt="{prompt}" raw ids (first 20)={original_ids[:20]}, logits.shape = {logits.shape}')
 
   decoder_segment_ids = np.zeros(s, dtype=np.int32)
   decoder_segment_ids[:, :seq_len] = DECODING_ACTIVE_SEQUENCE_INDICATOR
@@ -313,6 +313,31 @@ def main(config, test_args):  # pylint: disable=W0621
   init_rng, rng1 = jax.random.split(init_rng)
   devices_array = maxtext_utils.create_device_mesh(config)
   mesh = jax.sharding.Mesh(devices_array, config.mesh_axes)
+
+  # Load tokenizer so it is available for:
+  # 1. Pre-loaded golden logits comparison (multimodal input)
+  # 2. On-the-fly HuggingFace model comparison (text only input)
+  hf_token = config.hf_access_token
+  try:
+    if test_args.hf_model_path:
+      max_logging.log(f"Loading tokenizer from {test_args.hf_model_path}.")
+      tokenizer = AutoTokenizer.from_pretrained(
+          test_args.hf_model_path, token=hf_token, trust_remote_code=test_args.trust_remote_code
+      )
+    else:
+      max_logging.log(f"Loading tokenizer from {config.tokenizer_path}.")
+      tokenizer = AutoTokenizer.from_pretrained(
+          config.tokenizer_path, token=hf_token, trust_remote_code=test_args.trust_remote_code
+      )
+  except Exception as e:  # pylint: disable=broad-except
+    max_logging.log(f"Tokenizer loading error: {e}.\nLoading tokenizer from {config.tokenizer_path}.")
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.tokenizer_path, token=hf_token, trust_remote_code=test_args.trust_remote_code
+    )
+
+  pad_token_prefixes = ["llama3.1", "mixtral"]
+  if any(config.model_name.startswith(prefix) for prefix in pad_token_prefixes):
+    tokenizer.pad_token = tokenizer.eos_token
 
   if not test_args.run_hf_model:
     """Comparing maxtext/huggingface model with pre-loaded golden logitis"""
@@ -414,12 +439,28 @@ def main(config, test_args):  # pylint: disable=W0621
       max_rel_diff_val = rel_diff[max_rel_diff_idx]
       msg = (
           "\n[numerical difference]\n"
-          f"Max absolute difference: {max_abs_diff_val:.4e} at index {max_abs_diff_idx}\n"
-          f"  (Train: {train_logits_slice[max_abs_diff_idx]:.4e}, Golden: {golden_logits_slice[max_abs_diff_idx]:.4e})\n"
-          f"Max relative difference: {max_rel_diff_val:.4e} at index {max_rel_diff_idx}\n"
-          f"  (Train: {train_logits_slice[max_rel_diff_idx]:.4e}, Golden: {golden_logits_slice[max_rel_diff_idx]:.4e})"
+          f"Max absolute difference: {max_abs_diff_val:.2e} at index {max_abs_diff_idx}\n"
+          f"  (Train: {train_logits_slice[max_abs_diff_idx]:.2e}, Golden: {golden_logits_slice[max_abs_diff_idx]:.2e})\n"
+          f"Max relative difference: {max_rel_diff_val:.2e} at index {max_rel_diff_idx}\n"
+          f"  (Train: {train_logits_slice[max_rel_diff_idx]:.2e}, Golden: {golden_logits_slice[max_rel_diff_idx]:.2e})"
       )
       max_logging.log(msg)
+
+      # --- Compare logits for top-k token comparison table ---
+      mt_last_token_logits = (
+          convert_jax_weight_to_torch(train_logits_slice[-1:, :])
+          if isinstance(train_logits_slice, jax.Array)
+          else torch.tensor(train_logits_slice[-1:, :])
+      )
+      hf_last_token_logits = (
+          convert_jax_weight_to_torch(golden_logits_slice[-1:, :])
+          if isinstance(golden_logits_slice, jax.Array)
+          else torch.tensor(golden_logits_slice[-1:, :])
+      )
+
+      tokens_maxtext = get_top_k_tokens_scores(mt_last_token_logits, tokenizer, k=10, description="MaxText model")
+      tokens_hf = get_top_k_tokens_scores(hf_last_token_logits, tokenizer, k=10, description="HF model")
+      compare_top_tokens(converted_tokens=tokens_maxtext, golden_tokens=tokens_hf)
 
       if test_args.clip_logits_epsilon is not None:
         model_probabilities = jnp.clip(jax.nn.softmax(train_logits_slice, axis=-1), min=test_args.clip_logits_epsilon)
@@ -459,7 +500,7 @@ def main(config, test_args):  # pylint: disable=W0621
       max_kl_div_idx = jax.numpy.argmax(kl_div)
       max_logging.log(
           f"\n[KL divergence]\n"
-          f"KL divergence = {kl_div}, max KL divergence = {max_kl_div_val} at index {max_kl_div_idx}, "
+          f"max KL divergence = {max_kl_div_val:.2e} at index {max_kl_div_idx}, "
           f"the corresponding token id is {ids[0, max_kl_div_idx + start_index]}"
       )
 
@@ -533,25 +574,6 @@ def main(config, test_args):  # pylint: disable=W0621
       except ImportError as exc:
         raise ImportError("peft library is required to load HF LoRA adapter. Run `pip install peft`.") from exc
       hf_model = PeftModel.from_pretrained(hf_model, hf_lora_path)
-
-    # Load tokenizer: `test_args.hf_model_path` or fallback to `config.tokenizer_path`
-    try:
-      # Try loading from `test_args.hf_model_path`
-      max_logging.log(f"Loading tokenizer from {test_args.hf_model_path}.")
-      tokenizer = AutoTokenizer.from_pretrained(
-          test_args.hf_model_path, token=hf_token, trust_remote_code=test_args.trust_remote_code
-      )
-    except Exception as e:  # pylint: disable=broad-except
-      # Fallback to `config.tokenizer_path`. local hf directory may not contain tokenizer, read from remote tokenizer
-      max_logging.log(f"Tokenizer loading error: {e}.\nLoading tokenizer from {config.tokenizer_path}.")
-      tokenizer = AutoTokenizer.from_pretrained(
-          config.tokenizer_path, token=hf_token, trust_remote_code=test_args.trust_remote_code
-      )
-
-    # maxtext model prefix, use eos token as pad token
-    pad_token_prefixes = ["llama3.1", "mixtral"]
-    if any(config.model_name.startswith(prefix) for prefix in pad_token_prefixes):
-      tokenizer.pad_token = tokenizer.eos_token
 
     quant = quantizations.configure_quantization(config)
     if config.pure_nnx_decoder and config.enable_nnx:

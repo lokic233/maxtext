@@ -5,9 +5,9 @@
 
 # The flow of this script is as follows:
 # 1. Convert an original Hugging Face model checkpoint to MaxText format.
-# 2. Convert the resulting MaxText checkpoint back to Hugging Face format.
-# 3. Run a forward pass check to compare the logits and KL divergence between
+# 2. Run a forward pass check to compare the logits and KL divergence between
 #    the MaxText checkpoint and the Hugging Face checkpoint.
+# 3. (Optional) Convert the resulting MaxText checkpoint back to Hugging Face format.
 
 # Pre-requisites:
 # 1. Set HF_TOKEN environment variable to your Hugging Face access token.
@@ -61,15 +61,6 @@ python3 -m maxtext.checkpoint_conversion.to_maxtext \
 # Path to MaxText checkpoint
 export CKPT_PATH=${MODEL_BUCKET}/${MODEL_NAME}/${CHECKPOINT_TYPE}/${idx}/0/items
 
-python3 -m maxtext.checkpoint_conversion.to_huggingface \
-    "${MAXTEXT_CONFIGS_DIR:-${MAXTEXT_REPO_ROOT:-$PWD}/src/maxtext/configs}"/base.yml \
-    model_name=${MODEL_NAME} \
-    hf_access_token=${HF_TOKEN} \
-    load_parameters_path=${CKPT_PATH} \
-    base_output_directory=${LOCAL_PATH} \
-    use_multimodal=${USE_MULTIMODAL} \
-    scan_layers=${USE_SCAN_LAYERS} \
-    override_model_config=true
 
 # Run forward pass logit checker to validate the converted checkpoint.
 if [ "${USE_MULTIMODAL}" == true ]; then
@@ -82,7 +73,7 @@ if [ "${USE_MULTIMODAL}" == true ]; then
         --output-path=${GOLDEN_LOGITS_PATH} \
         --prompts="${TEST_PROMPT}" \
         --image-paths=${TEST_IMAGE} \
-        --hf-model-path=${LOCAL_PATH} \
+        --hf-model-path=${HF_MODEL} \
         --apply-chat-template \
         --output-format=json
 
@@ -124,6 +115,18 @@ else
         wo_tile_fwd_mlp_dim=512 \
         --max_kl_div=0.1 \
         --run_hf_model=true \
-        --hf_model_path=${LOCAL_PATH} \
+        --hf-model-path=${HF_MODEL} \
         override_model_config=true
 fi
+
+# Optional: Convert checkpoint back to HF format
+python3 -m maxtext.checkpoint_conversion.to_huggingface \
+    "${MAXTEXT_CONFIGS_DIR:-${MAXTEXT_REPO_ROOT:-$PWD}/src/maxtext/configs}"/base.yml \
+    model_name=${MODEL_NAME} \
+    hf_access_token=${HF_TOKEN} \
+    load_parameters_path=${CKPT_PATH} \
+    base_output_directory=${LOCAL_PATH} \
+    use_multimodal=${USE_MULTIMODAL} \
+    scan_layers=${USE_SCAN_LAYERS} \
+    override_model_config=true
+
