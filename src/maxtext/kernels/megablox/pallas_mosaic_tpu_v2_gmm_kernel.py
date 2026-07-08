@@ -352,7 +352,9 @@ def inner_kernel(
     tiled_out_ref: jax.Array,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_n]
     # Scratch
-    partial_out_ref: jax.Array,  # [size_lhs_sublane, tile_n]
+    # [num_n, size_lhs_sublane, tile_n] Partitioned by num_n to prevent VMEM
+    # conflict when num_n > 1.
+    partial_out_ref: jax.Array,
     acc_ref: jax.Array,  # [tile_m, tile_n]
     metadata_ref: MetadataRef,
     *,
@@ -532,13 +534,17 @@ def inner_kernel(
       # Write the final output to the output ref.
       tiled_out_ref[...] = acc_masked.astype(tiled_out_ref.dtype)
 
+      n_id = pl.program_id(0)
+
       # If this is the first tile for grid[n_id, :, :], we initialize the
       # partial out to zeros. Otherwise, partial out from last tile of
       # grid[n_id-1, :, :] can be used and cause numeric issues.
-      partial_out_zeros = jnp.zeros_like(partial_out_ref)
+      partial_out_zeros = jnp.zeros_like(partial_out_ref[0])
 
       # Accumulate the partial output from the previous step.
-      tiled_out_ref[0] += jnp.where(gm_id == 0, partial_out_zeros, partial_out_ref[...])
+      tiled_out_ref[0] += jnp.where(
+          gm_id == 0, partial_out_zeros, partial_out_ref[n_id]
+      )
 
       # Consider following case where size_lhs_sublane = 4, number denotes group
       # id and | denotes boundaries between sublanes:
@@ -551,7 +557,7 @@ def inner_kernel(
       # since it completely fills the size_lhs_sublane rows, we need to zero out
       # partial_out_ref to avoid numeric error for group 3.
       last_row = m_end_local // cfgs.dims.size_lhs_sublane
-      partial_out_ref[...] = jnp.where(
+      partial_out_ref[n_id] = jnp.where(
           m_end_local % cfgs.dims.size_lhs_sublane == 0,
           partial_out_zeros,
           tiled_out_ref[last_row],
@@ -1276,10 +1282,12 @@ def gmm_v2(
 
   # Initialize scratch shapes.
   max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
+  num_n = pl.cdiv(cfgs.out_size_n, tiles.tile_n)
   acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
   scratch_shapes = [
-      # partial_out_ref
-      pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
+      # partial_out_ref. Partitioned by num_n to prevent concurrent N programs
+      # from overwriting each other's partial results when num_n > 1.
+      pltpu.VMEM((num_n, dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
       # acc_ref
       pltpu.VMEM((tiles.tile_m, acc_cols), cfgs.acc_dtype),
       # metadata_ref
