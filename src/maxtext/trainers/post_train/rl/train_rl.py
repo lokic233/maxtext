@@ -114,7 +114,7 @@ def _tpu_inference_compat_patches():
 
 os.environ["TOKENIZERS_PARALLELISM"] = "0"
 
-from maxtext.configs import pyconfig
+from maxtext.configs import pyconfig, types
 from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
 from maxtext.integration.vllm.maxtext_vllm_rollout import MaxTextVllmRollout
 from maxtext.trainers.post_train.rl.evaluate_rl import evaluate
@@ -448,7 +448,7 @@ def create_rl_components(
   # We need to parse vLLM config to get the logical axis rules for the sampler config.
   vllm_config_path = os.path.join(MAXTEXT_CONFIGS_DIR, "inference", "vllm.yml")
   argv_list = ["", str(vllm_config_path), "log_config=False"]
-  vllm_config = pyconfig.initialize(argv_list)
+  vllm_config = pyconfig.initialize(argv_list, config_class=types.RLSamplerConfig)
 
   rl_rollout_engine = (
       functools.partial(MaxTextVllmRollout, maxtext_config=trainer_config)
@@ -672,7 +672,7 @@ def validate_config(config):
 def _rl_train_impl(argv: Sequence[str], kwargs: dict):
   """rl_train body — kept separate so _tpu_inference_compat_patches wraps it cleanly."""
   trainer_config, sampler_config, trainer_devices, sampler_devices = model_creation_utils.setup_configs_and_devices(
-      argv, kwargs
+      config_class=types.RLTrainerConfig, argv, kwargs
   )
   validate_config(trainer_config)
 
