@@ -25,6 +25,7 @@ from flax import nnx
 from flax.linen import partitioning as nn_partitioning
 
 from maxtext.common import checkpointing
+from maxtext.common import emergency_checkpointing
 from maxtext.common import train_state_nnx
 from maxtext.common.common_types import ReorderStrategy
 from maxtext.common.data_loader import create_dataloader
@@ -52,7 +53,7 @@ def create_checkpoint_manager(config, mesh, init_state_fn):
   # pass in model for muon
   logger = checkpointing.setup_checkpoint_logger(config)
   if config.enable_multi_tier_checkpointing:
-    checkpoint_manager = checkpointing.create_orbax_emergency_replicator_checkpoint_manager(
+    checkpoint_manager = emergency_checkpointing.create_replicator_checkpoint_manager(
         config.local_checkpoint_directory,
         config.local_checkpoint_period,
         mesh,
@@ -60,7 +61,7 @@ def create_checkpoint_manager(config, mesh, init_state_fn):
     )
   elif config.enable_emergency_checkpoint:
     abstract_state, _, _ = maxtext_utils.get_abstract_state(config, mesh, init_state_fn, is_training=True)
-    checkpoint_manager = checkpointing.create_orbax_emergency_checkpoint_manager(
+    checkpoint_manager = emergency_checkpointing.create_emergency_checkpoint_manager(
         config.local_checkpoint_directory,
         config.checkpoint_dir,
         mesh,
@@ -249,7 +250,7 @@ def setup_train_loop(config, recorder, devices=None):
       init_state_fn = partial(maxtext_utils.init_initial_state, model, tx, config, is_training, init_rng)
     checkpoint_manager = create_checkpoint_manager(config, mesh, init_state_fn)
     if checkpoint_manager is not None:
-      checkpoint_step = checkpoint_manager.latest_step()
+      checkpoint_step = checkpointing.latest_step(checkpoint_manager)
       if checkpoint_step is not None:
         validate_completed_steps(checkpoint_step + 1, config.steps)
 
@@ -321,23 +322,15 @@ def setup_train_loop(config, recorder, devices=None):
         state, outer_opt_state_sharding = diloco.build_diloco_state(config, lambda: state, mesh=mesh)
 
         # create state_mesh_shardings for the DilocoState
-        step_mesh = (
-            state_mesh_shardings.optimizer.step.mesh
-            if config.pure_nnx
-            else state_mesh_shardings.step.mesh
-        )
+        step_mesh = state_mesh_shardings.optimizer.step.mesh if config.pure_nnx else state_mesh_shardings.step.mesh
         inner_state_shardings = diloco.add_diloco_to_sharding(state_mesh_shardings)
         state_mesh_shardings = diloco.DiLoCoTrainState(
             inner_state_shardings,
             # Match the outer params' pure-dict structure (build_diloco_state stores
             # outer_params via to_pure_dict), so the sharding tree matches the state tree.
-            state_mesh_shardings_params.to_pure_dict()
-            if config.pure_nnx
-            else state_mesh_shardings_params,
+            state_mesh_shardings_params.to_pure_dict() if config.pure_nnx else state_mesh_shardings_params,
             outer_opt_state_sharding,
-            jax.sharding.NamedSharding(
-                mesh=step_mesh, spec=jax.sharding.PartitionSpec()
-            ),
+            jax.sharding.NamedSharding(mesh=step_mesh, spec=jax.sharding.PartitionSpec()),
         )
 
     # TODO(aireenmei, hengtaoguo): support sharding in vit for multimodal

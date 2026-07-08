@@ -233,7 +233,7 @@ def _save_decode_checkpoint(config, state, checkpoint_manager):
   if checkpoint_manager is not None:
     if checkpointing.save_checkpoint(checkpoint_manager, 0, decode_state):
       max_logging.log(f"saved an decode checkpoint at {config.checkpoint_dir}")
-  checkpoint_manager.wait_until_finished()
+  checkpointing.wait_until_finished(checkpoint_manager)
 
 
 def _save_decode_checkpoint_nnx(config, state, checkpoint_manager):
@@ -261,7 +261,7 @@ def _save_decode_checkpoint_nnx(config, state, checkpoint_manager):
   if checkpoint_manager is not None:
     if checkpointing.save_checkpoint(checkpoint_manager, 0, bf16_model):
       max_logging.log(f"saved an NNX decode checkpoint at {config.checkpoint_dir}")
-    checkpoint_manager.wait_until_finished()
+    checkpointing.wait_until_finished(checkpoint_manager)
 
 
 def _possibly_unroll_lora_params_nnx(config, lora_state, lora_state_annotations, mesh):
@@ -325,7 +325,7 @@ def _save_lora_decode_checkpoint_nnx(config, lora_state, checkpoint_manager):
   if checkpoint_manager is not None:
     if checkpointing.save_checkpoint(checkpoint_manager, 0, decode_state):
       max_logging.log(f"saved a LoRA decode checkpoint at {config.checkpoint_dir}")
-    checkpoint_manager.wait_until_finished()
+    checkpointing.wait_until_finished(checkpoint_manager)
 
 
 def _generate_lora_decode_checkpoints_nnx(config, mesh):
@@ -400,13 +400,9 @@ def generate_decode_checkpoint(config):
   training_state, training_state_annotations = _read_train_checkpoint(config, checkpoint_manager, mesh)
   if config.pure_nnx:
     # NNX state is a flat nnx.State; opt_state lives under the optimizer sub-state.
-    assert (
-        training_state.optimizer.opt_state
-    ), "missing opt_state in training checkpoint"
+    assert training_state.optimizer.opt_state, "missing opt_state in training checkpoint"
   else:
-    assert (
-        training_state.opt_state != {}
-    ), "missing opt_state in training checkpoint"
+    assert training_state.opt_state != {}, "missing opt_state in training checkpoint"
 
   _possibly_unroll_params(config, training_state, training_state_annotations, mesh)
 
