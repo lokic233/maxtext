@@ -470,6 +470,9 @@ class Quantization(BaseModel):
       50,
       description=("The first number of steps before updating the sparsity masks."),
   )
+  use_te_comm_gemm_overlap: bool = Field(
+      False, description="If True, uses Transformer Engine's collective GEMM overlap algorithm."
+  )
 
 
 class ModelArchitecture(BaseModel):
@@ -963,7 +966,6 @@ class HardwareAndMesh(BaseModel):
           "context",
           "context_autoregressive",
           "tensor",
-          "tensor_transpose",
           "tensor_sequence",
           "expert",
           "autoregressive",
@@ -972,7 +974,13 @@ class HardwareAndMesh(BaseModel):
   )
   shard_mode: ShardMode = Field("auto", description="can be either auto or explicit")
   inhomogeneous_layer_cycle_interval: int = Field(1, description="The interval of repeated inhomogeneous layer patterns.")
-  scan_layers: bool = Field(True, description="Whether to use jax.lax.scan over layers.")
+  scan_layers: bool = Field(
+      True,
+      description=(
+          "Whether to use jax.lax.scan over layers (stacked/unstacked checkpoint). "
+          "When resuming from a checkpoint, this flag is auto-determined from metadata."
+      ),
+  )
   param_scan_axis: int = Field(1, description="Axis to scan over for parameters.")
   context_parallel_load_balance: bool = Field(True, description="Whether to use load balancing for context parallelism.")
   context_parallel_strategy: str = Field(
@@ -1036,7 +1044,6 @@ class DcnParallelism(BaseModel):
   dcn_context_parallelism: int = Field(1, description="DCN axis for context parallelism.")
   dcn_context_autoregressive_parallelism: int = Field(1, description="DCN axis for context autoregressive parallelism.")
   dcn_tensor_parallelism: int = Field(1, description="DCN axis for tensor parallelism (not recommended).")
-  dcn_tensor_transpose_parallelism: int = Field(1, description="DCN axis for tensor transpose parallelism.")
   dcn_tensor_sequence_parallelism: int = Field(
       1, description="DCN axis for tensor sequence parallelism (not recommended)."
   )
@@ -1056,7 +1063,6 @@ class IciParallelism(BaseModel):
   ici_context_parallelism: int = Field(1, description="ICI axis for context parallelism.")
   ici_context_autoregressive_parallelism: int = Field(1, description="ICI axis for context autoregressive parallelism.")
   ici_tensor_parallelism: int = Field(1, description="ICI axis for tensor parallelism.")
-  ici_tensor_transpose_parallelism: int = Field(1, description="ICI axis for tensor transpose parallelism.")
   ici_tensor_sequence_parallelism: int = Field(1, description="ICI axis for tensor sequence parallelism.")
   ici_autoregressive_parallelism: int = Field(1, description="ICI axis for autoregressive parallelism.")
   ici_pipeline_parallelism: int = Field(1, description="ICI axis for pipeline parallelism.")
@@ -2156,10 +2162,6 @@ class RL(BaseModel):
       "",
       description="System prompt injected into the agent at rollout time (agentic only).",
   )
-  degenerate_group_masking: bool = Field(
-      True,
-      description="Mask degenerate groups (all-zero advantages) from contributing to loss (agentic only).",
-  )
   epsilon_high: Optional[float] = Field(
       None,
       description="Upper-bound clipping epsilon for GRPO loss. Defaults to epsilon when None (agentic only).",
@@ -2189,6 +2191,20 @@ class RLDataset(BaseModel):
       description=(
           "Optional path to a user-provided Python file with a `process_data` function. "
           "When set, replaces the built-in dataset processor for custom datasets."
+      ),
+  )
+  reward_functions_path: str = Field(
+      "",
+      description=(
+          "Optional path to a user Python file containing custom reward functions. "
+          "Used with `reward_functions` to fully replace the built-in reward stack."
+      ),
+  )
+  reward_functions: str = Field(
+      "",
+      description=(
+          "Comma-separated names of reward functions to import from `reward_functions_path`. "
+          "Each function signature: (prompts, completions, tmvp_config, **kwargs) -> list[float]."
       ),
   )
 
@@ -2553,6 +2569,26 @@ class MaxTextConfig(
           "Ragged buffer factor is currently only supported with:\n"
           "  1. Ragged A2A approach (use_ring_of_experts=False)\n"
           "  2. Ragged sort with ring of experts (use_ring_of_experts=True AND use_ragged_sort=True)"
+      )
+
+  def _validate_use_te_comm_gemm_overlap(self):
+    """Validates that use_te_comm_gemm_overlap is used with supported settings to enable TE Collective GEMM ops."""
+    te_has_distributed_env = jax.local_device_count() == 1 and jax.distributed.is_initialized()
+
+    if self.hardware != "gpu_multiprocess" or not te_has_distributed_env:
+      raise ValueError(
+          "TE Collective GEMM operations are only supported for hardware=gpu_multiprocess with rank per GPU."
+      )
+
+    tsp_size = self.ici_tensor_sequence_parallelism * self.dcn_tensor_sequence_parallelism
+    tp_size = self.ici_tensor_parallelism * self.dcn_tensor_parallelism
+
+    if tsp_size == 1 or tp_size > 1:
+      raise ValueError("TE Collective GEMM operations are only supported for TSP size > 1 and TP size == 1.")
+
+    if not self.quantization.startswith("te_"):
+      raise ValueError(
+          "TE Collective GEMM operations are only supported for TE quantization recipes (i.e. starting with 'te_')."
       )
 
   @model_validator(mode="after")
@@ -3393,7 +3429,6 @@ class MaxTextConfig(
         "context": self.ici_context_parallelism,
         "context_autoregressive": self.ici_context_autoregressive_parallelism,
         "tensor": self.ici_tensor_parallelism,
-        "tensor_transpose": self.ici_tensor_transpose_parallelism,
         "tensor_sequence": self.ici_tensor_sequence_parallelism,
         "model": self.ici_tensor_parallelism,
         "expert": self.ici_expert_parallelism,
@@ -3413,7 +3448,6 @@ class MaxTextConfig(
         "context": self.dcn_context_parallelism,
         "context_autoregressive": self.dcn_context_autoregressive_parallelism,
         "tensor": self.dcn_tensor_parallelism,
-        "tensor_transpose": self.dcn_tensor_transpose_parallelism,
         "tensor_sequence": self.dcn_tensor_sequence_parallelism,
         "model": self.dcn_tensor_parallelism,
         "expert": self.dcn_expert_parallelism,
@@ -3452,6 +3486,9 @@ class MaxTextConfig(
       )
 
     self._validate_check_vma_is_supported()
+
+    if self.use_te_comm_gemm_overlap:
+      self._validate_use_te_comm_gemm_overlap()
 
     # Final string-to-enum conversions if they haven't been coerced by pydantic yet.
     if isinstance(self.decoder_block, str):

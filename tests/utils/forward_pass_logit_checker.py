@@ -349,8 +349,7 @@ def main(config, test_args):  # pylint: disable=W0621
       if config.lora.enable_lora:
         model = lora_utils.apply_lora_to_model(model, mesh, config)
         if config.lora.lora_restore_path:
-          mock_trainer = type("MockTrainer", (), {"model": model, "train_steps": 0})
-          lora_utils.restore_lora_from_path(mock_trainer, config)
+          lora_utils.restore_lora_from_path(model, config)
       state = None
     else:
       model = models.transformer_as_linen(config, mesh=mesh, quant=quant, model_mode=MODEL_MODE_TRAIN)
@@ -582,8 +581,7 @@ def main(config, test_args):  # pylint: disable=W0621
       if config.lora.enable_lora:
         maxtext_model = lora_utils.apply_lora_to_model(maxtext_model, mesh, config)
         if config.lora.lora_restore_path:
-          mock_trainer = type("MockTrainer", (), {"model": maxtext_model, "train_steps": 0})
-          lora_utils.restore_lora_from_path(mock_trainer, config)
+          lora_utils.restore_lora_from_path(maxtext_model, config)
       maxtext_state = None
     else:
       maxtext_model = models.transformer_as_linen(config, mesh, quant=quant, model_mode=MODEL_MODE_TRAIN)
