@@ -2226,6 +2226,16 @@ class VisionTower(BaseModel):
   """Configuration for the Vision Tower (Encoder) in a multimodal model."""
 
   hidden_size_for_vit: int = Field(1408, description="Hidden size for the Vision Transformer.")
+  standardize_for_vit: bool = Field(
+      False,
+      description=(
+          "Whether the vision tower applies checkpoint-resident standardization (std_bias/std_scale). "
+          "Mirrors HF vision_config.standardize. E2B/E4B ship standardize=False and DO NOT store std_bias/"
+          "std_scale in their safetensors; when False the standardize op is an exact identity and MaxText "
+          "must NOT fabricate trainable std params (doing so puts identity leaves into the gradient filter). "
+          "Only 26B/31B-style checkpoints with standardize=True carry real std tensors."
+      ),
+  )
   intermediate_size_for_vit: int = Field(5632, description="Intermediate size for the Vision Transformer's MLP.")
   num_attention_heads_for_vit: int = Field(16, description="Number of attention heads in the Vision Transformer.")
   num_channels_for_vit: int = Field(
