@@ -944,12 +944,20 @@ class Gemma4VisionEncoderLayer(nnx.Module):
         rngs=self.rngs,
         precision=config.matmul_precision,
     )
-    self.std_bias = nnx.Param(
-        nnx.initializers.zeros(self.rngs.params(), (config.hidden_size_for_vit,), config.weight_dtype), sharding=(None,)
-    )
-    self.std_scale = nnx.Param(
-        nnx.initializers.ones(self.rngs.params(), (config.hidden_size_for_vit,), config.weight_dtype), sharding=(None,)
-    )
+    # Vision standardization (std_bias/std_scale) is CHECKPOINT-RESIDENT state present ONLY when the
+    # checkpoint ships std tensors (vision_config.standardize=True, e.g. 26B/31B). E2B/E4B have
+    # standardize=False and DO NOT store std_scale/std_bias in their safetensors. When disabled, the
+    # standardize op is an EXACT identity: do NOT fabricate trainable identity nnx.Param leaves (that
+    # would wrongly enter the nnx.Param gradient filter and, being checkpoint-restored committed sharded
+    # arrays, get deleted under nnx.value_and_grad — the M10 std_bias[768] deletion). Fidelity fix (Case A).
+    self._standardize_for_vit = bool(getattr(config, "standardize_for_vit", False))
+    if self._standardize_for_vit:
+      self.std_bias = nnx.Param(
+          nnx.initializers.zeros(self.rngs.params(), (config.hidden_size_for_vit,), config.weight_dtype), sharding=(None,)
+      )
+      self.std_scale = nnx.Param(
+          nnx.initializers.ones(self.rngs.params(), (config.hidden_size_for_vit,), config.weight_dtype), sharding=(None,)
+      )
 
   def __call__(
       self,
@@ -1003,9 +1011,10 @@ class Gemma4VisionEncoderLayer(nnx.Module):
       vision_exit_results = self.vision_exit(x, positions_xy=positions_xy)
       (embeddings, _) = vision_exit_results[0]
 
-      embeddings = (embeddings - self.std_bias.value.astype(embeddings.dtype)) * self.std_scale.value.astype(
-          embeddings.dtype
-      )
+      if self._standardize_for_vit:
+        embeddings = (embeddings - self.std_bias.value.astype(embeddings.dtype)) * self.std_scale.value.astype(
+            embeddings.dtype
+        )
 
       # Unflatten batch and num_images
       final_x = jnp.reshape(embeddings, (b, n, embeddings.shape[1], embeddings.shape[2]))
@@ -1060,9 +1069,10 @@ class Gemma4VisionEncoderLayer(nnx.Module):
     vision_exit_results = self.vision_exit(x, positions_xy=positions_xy)
     (embeddings, image_masks) = vision_exit_results[0]  # embeddings [B*N, K, D], mask [B*N, K]
 
-    embeddings = (embeddings - self.std_bias.value.astype(embeddings.dtype)) * self.std_scale.value.astype(
-        embeddings.dtype
-    )
+    if self._standardize_for_vit:
+      embeddings = (embeddings - self.std_bias.value.astype(embeddings.dtype)) * self.std_scale.value.astype(
+          embeddings.dtype
+      )
 
     final_x = jnp.reshape(embeddings, (b, n, embeddings.shape[1], embeddings.shape[2]))
     if image_masks is None:
