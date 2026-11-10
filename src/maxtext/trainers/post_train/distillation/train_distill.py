@@ -34,13 +34,14 @@ Architecture Overview:
 """
 
 import inspect
+import itertools
 import logging
 import shlex
 from typing import Sequence, Callable, Any
 from absl import app
 from etils import epath
 from flax import nnx
-from flax.linen import partitioning as nn_partitioning
+from flax.core.spmd import logical_axis_rules
 import jax
 import jax.numpy as jnp
 import optax
@@ -56,8 +57,18 @@ from maxtext.input_pipeline import input_pipeline_interface
 from maxtext.layers.learn_to_init_layer import apply_lti_model_update
 from maxtext.optimizers import optimizers
 from maxtext.trainers.post_train.distillation import distillation_utils, lti_utils
+from maxtext.trainers.post_train.hooks import GoodputTrainingHooks
 from maxtext.utils import max_logging
 from maxtext.utils import maxtext_utils
+from maxtext.common.goodput import (
+    GoodputEvent,
+    RECORD_JOB_END_TIME,
+    RECORD_JOB_START_TIME,
+    create_goodput_recorder,
+    maybe_monitor_goodput,
+    maybe_record_goodput,
+    record_goodput,
+)
 from maxtext.utils import model_creation_utils
 
 # Tunix Imports
@@ -71,7 +82,7 @@ from tunix.sft import profiler
 # -----------------------------------------------------------------------------
 
 
-def get_distillation_optimizer(config, max_train_steps):
+def get_distillation_optimizer(config, max_train_steps, model=None):
   """Creates a custom optimizer for distillation that enables Learning Rate logging.
 
   This function constructs an optax optimizer using standard MaxText settings but
@@ -84,6 +95,7 @@ def get_distillation_optimizer(config, max_train_steps):
         `learning_rate`, `adam_b1`, `opt_type`, `gradient_clipping_threshold`).
     max_train_steps: The total number of training steps, used to calculate
         the warmup and cosine decay schedule.
+    model: The student model, whose UntrainableParam weights are frozen.
 
   Returns:
     An optax optimizer that:
@@ -105,11 +117,14 @@ def get_distillation_optimizer(config, max_train_steps):
       end_value=config.learning_rate_final_fraction * config.learning_rate,
   )
 
+  # inject_hyperparams reruns the factory inside jit, so read the model once here.
+  frozen_paths = optimizers.untrainable_paths(model)
+
   # 2. Define Factory (Required for inject_hyperparams)
   def optimizer_factory(learning_rate):
     # Reuse MaxText's standard logic to create the base optimizer.
     # We pass 'learning_rate' (which is the injected schedule) directly.
-    opt = optimizers.get_optimizer(config, learning_rate, model=None)
+    opt = optimizers.get_optimizer(config, learning_rate, model=None, frozen_paths=frozen_paths)
 
     # Apply Gradient Clipping
     if config.gradient_clipping_threshold > 0:
@@ -276,7 +291,15 @@ class MaxTextDistillationTrainer(peft_trainer.PeftTrainer):
 
   # Inherits _shard_optimizer from PeftTrainer.
 
-  def _train_step(self, model, optimizer, inputs, grad_accumulator=None, **kwargs):  # pyrefly: ignore[bad-override]
+  def _train_step(
+      self,
+      model,
+      optimizer,
+      grad_accumulator,
+      inputs,
+      is_update_step=True,
+      **kwargs,
+  ):  # pyrefly: ignore[bad-override]
     """Overrides the main JIT block to natively handle ModelBundle module.
 
     Uses jax.value_and_grad with explicit split/merge to avoid nesting
@@ -442,12 +465,12 @@ class MaxTextDistillationTrainer(peft_trainer.PeftTrainer):
 
     for name, value in aux.items():
       if name not in self._buffered_train_metrics.additional_metrics:
-        self._buffered_train_metrics.additional_metrics[name] = (  # pyrefly: ignore[unsupported-operation]
+        self._buffered_train_metrics.additional_metrics[name] = (
             [],
             distillation_utils.weighted_mean,
-        )  # pyrefly: ignore[unsupported-operation]
+        )
 
-      self._buffered_train_metrics.additional_metrics[name][0].append(value)  # pyrefly: ignore[bad-argument-type]
+      self._buffered_train_metrics.additional_metrics[name][0].append(value)
 
     # Compact per-step summary: only the metrics that change run-to-run, and
     # only those that are nonzero (so MoE / feature-distill terms hide when off).
@@ -576,12 +599,14 @@ def build_training_components(
     teacher_config: pyconfig.HyperParameters,
     is_offline: bool = False,
     offline_data_dir: str | None = None,
+    student_model: nnx.Module | None = None,
 ):
   """Builds and returns the strategy, optimizer, and training config objects.
 
   Args:
     student_config: Configuration object for the Student model.
     teacher_config: Configuration object for the Teacher model.
+    student_model: The Student model, whose UntrainableParam weights the optimizer freezes.
 
   Returns:
     A tuple of (DistillationStrategy, Optimizer, TrainingConfig).
@@ -623,7 +648,7 @@ def build_training_components(
   )
 
   # Prepare optimizer
-  optimizer = get_distillation_optimizer(student_config, student_config.steps)
+  optimizer = get_distillation_optimizer(student_config, student_config.steps, model=student_model)
 
   checkpointing_options = checkpoint.CheckpointManagerOptions(
       save_interval_steps=student_config.checkpoint_period,
@@ -639,6 +664,7 @@ def build_training_components(
         skip_first_n_steps=student_config.skip_first_n_steps_for_profiler,
         profiler_steps=student_config.profiler_steps,
         set_profile_options=False,
+        enable_continuous_profiling=student_config.enable_continuous_profiling,
     )
 
   metrics_logging_options = metrics_logger.MetricsLoggerOptions(
@@ -681,121 +707,154 @@ def train_distill(
         "Distillation requires matching vocabularies."
     )
 
-  # Build Training Components (No hardware context required)
-  strategy, optimizer, train_config = build_training_components(
-      student_config, teacher_config, is_offline, offline_data_dir
-  )
+  goodput_recorder = create_goodput_recorder(student_config)
+  record_goodput(goodput_recorder, RECORD_JOB_START_TIME)
+  _job_completed_gracefully = False
+  try:
+    with maybe_monitor_goodput(student_config):
+      _train_distill_impl(student_config, teacher_config, is_offline, offline_data_dir, goodput_recorder)
+      _job_completed_gracefully = True
+  finally:
+    if _job_completed_gracefully:
+      record_goodput(goodput_recorder, RECORD_JOB_END_TIME)
 
-  # 1. Setup Mesh
-  devices = jax.devices()
-  devices_array = maxtext_utils.create_device_mesh(student_config, devices)
-  mesh = jax.sharding.Mesh(devices_array, student_config.mesh_axes)
+
+def _train_distill_impl(
+    student_config: pyconfig.HyperParameters,
+    teacher_config: pyconfig.HyperParameters,
+    is_offline: bool = False,
+    offline_data_dir: str | None = None,
+    goodput_recorder: Any = None,
+) -> None:
+  """Internal distillation training implementation."""
+  with maybe_record_goodput(goodput_recorder, GoodputEvent.TPU_INIT):
+    # 1. Setup Mesh
+    devices = jax.devices()
+    devices_array = maxtext_utils.create_device_mesh(student_config, devices)
+    mesh = jax.sharding.Mesh(devices_array, student_config.mesh_axes)
+
+    # 2. Load Models
+    max_logging.log("Applying logical axis rules for model initialization and training...")
+    with jax.set_mesh(mesh), logical_axis_rules(student_config.logical_axis_rules):
+      if is_offline:
+        max_logging.log("Offline Distillation: Skipping Teacher Model loading.")
+        teacher_model = None
+      else:
+        max_logging.log(f"Loading Teacher from {teacher_config.load_parameters_path}...")
+        _log_config_details(teacher_config, "Teacher")
+        teacher_model = get_maxtext_model(teacher_config, mesh)
+        teacher_model.eval()
+
+      # LTI phase needs the student initialization step to know about the teacher configuration
+      student_config.get_keys()["teacher_config"] = teacher_config
+
+      max_logging.log(f"Loading Student from {student_config.load_parameters_path}...")
+      _log_config_details(student_config, "Student")
+      student_model = get_maxtext_model(student_config, mesh)
+      student_params_to_update = getattr(student_config, "student_params_to_update", []) or []
+      student_param_update_templates = [re.compile(t) for t in student_params_to_update]
+
+      def student_freeze_param_fn(path) -> bool:
+        path_str = "/".join(str(p) for p in path)
+        return not any(regex.search(path_str) for regex in student_param_update_templates)
+
+      # Inject the teacher's frozen weights into the student model
+      if teacher_model:
+        lti_utils.prepare_student_weights(
+            student_model,
+            teacher_model,
+            teacher_weights_copy_map=getattr(student_config, "distill_weights_copy_map", {}),
+            student_weights_share_map=getattr(student_config, "distill_student_weights_share_map", {}),
+        )
+
+      student_model.train()
+      model_bundle = ModelBundle(teacher_model, student_model)
 
   # Hardware Execution (Safe Context)
-  max_logging.log("Applying logical axis rules for model initialization and training...")
-  with jax.set_mesh(mesh), nn_partitioning.axis_rules(student_config.logical_axis_rules):
-    # 2. Load Models
-    if is_offline:
-      max_logging.log("Offline Distillation: Skipping Teacher Model loading.")
-      teacher_model = None
-    else:
-      max_logging.log(f"Loading Teacher from {teacher_config.load_parameters_path}...")
-      _log_config_details(teacher_config, "Teacher")
-      teacher_model = get_maxtext_model(teacher_config, mesh)
-      teacher_model.eval()
-
-    # LTI phase needs the student initialization step to know about the teacher configuration
-    student_config.get_keys()["teacher_config"] = teacher_config
-
-    max_logging.log(f"Loading Student from {student_config.load_parameters_path}...")
-    _log_config_details(student_config, "Student")
-    student_model = get_maxtext_model(student_config, mesh)
-    student_params_to_update = getattr(student_config, "student_params_to_update", []) or []
-    student_param_update_templates = [re.compile(t) for t in student_params_to_update]
-
-    def student_freeze_param_fn(path) -> bool:
-      path_str = "/".join(str(p) for p in path)
-      return not any(regex.search(path_str) for regex in student_param_update_templates)
-
-    # Inject the teacher's frozen weights into the student model
-    if teacher_model:
-      lti_utils.prepare_student_weights(
-          student_model,
-          teacher_model,
-          teacher_weights_copy_map=getattr(student_config, "distill_weights_copy_map", {}),
-          student_weights_share_map=getattr(student_config, "distill_student_weights_share_map", {}),
+  with jax.set_mesh(mesh), logical_axis_rules(student_config.logical_axis_rules):
+    with maybe_record_goodput(goodput_recorder, GoodputEvent.TRAINING_PREPARATION):
+      # Build Training Components
+      strategy, optimizer, train_config = build_training_components(
+          student_config, teacher_config, is_offline, offline_data_dir, student_model=student_model
       )
 
-    student_model.train()
-    model_bundle = ModelBundle(teacher_model, student_model)
+      # 3. Initialize Trainer
+      trainer = MaxTextDistillationTrainer(
+          model=model_bundle,
+          strategy=strategy,
+          optimizer=optimizer,
+          training_config=train_config,
+          student_config=student_config,
+          teacher_config=teacher_config,
+          is_offline=is_offline,
+          student_freeze_param_filter=student_freeze_param_fn if student_params_to_update else None,
+      )
+      trainer.is_managed_externally = True
+      trainer._has_aux = True  # pylint: disable=protected-access
 
-    # 3. Initialize Trainer
-    trainer = MaxTextDistillationTrainer(
-        model=model_bundle,
-        strategy=strategy,
-        optimizer=optimizer,
-        training_config=train_config,
-        student_config=student_config,
-        teacher_config=teacher_config,
-        is_offline=is_offline,
-        student_freeze_param_filter=student_freeze_param_fn if student_params_to_update else None,
-    )
-    trainer.is_managed_externally = True
-    trainer._has_aux = True  # pylint: disable=protected-access
+      if is_offline:
+        max_logging.log("Initializing Data Iterators via MaxText pipeline...")
 
-    if is_offline:
-      max_logging.log("Initializing Data Iterators via MaxText pipeline...")
+        # Point Grain to offline files instead of the raw text dataset
+        student_config.get_keys()["grain_train_files"] = offline_data_dir
 
-      # Point Grain to offline files instead of the raw text dataset
-      student_config.get_keys()["grain_train_files"] = offline_data_dir
+        student_config.get_keys()["eval_interval"] = 0
+        student_config.get_keys()["is_offline_distillation"] = True
+        student_config.get_keys()["dataset_shuffle_buffer_size"] = 0
+        student_config.get_keys()["dataset_shuffle_seed"] = 0
 
-      student_config.get_keys()["eval_interval"] = 0
-      student_config.get_keys()["is_offline_distillation"] = True
-      student_config.get_keys()["dataset_shuffle_buffer_size"] = 0
-      student_config.get_keys()["dataset_shuffle_seed"] = 0
+      raw_train_iter, raw_eval_iter = input_pipeline_interface.create_data_iterator(student_config, mesh)
 
-    raw_train_iter, raw_eval_iter = input_pipeline_interface.create_data_iterator(student_config, mesh)
+      # 5. Input Pipeline Checkpointing & Restoration
+      # Replace the default CheckpointManager with a Grain-aware one, which enables
+      # iterator checkpointing for grain datasets.
+      raw_train_iter = trainer.setup_checkpoint_manager_and_restore(raw_train_iter, student_config)
 
-    # 5. Input Pipeline Checkpointing & Restoration
-    # Replace the default CheckpointManager with a Grain-aware one, which enables iterator checkpointing for grain datasets.
-    raw_train_iter = trainer.setup_checkpoint_manager_and_restore(raw_train_iter, student_config)
+      # Sync the ModelBundle step counter with the restored training step so that
+      # loss weight schedules resume from the correct position after checkpoint restore.
+      model_bundle.training_step.set_value(jnp.array(trainer._train_steps, dtype=jnp.int32))  # pylint: disable=protected-access
 
-    # Sync the ModelBundle step counter with the restored training step so that
-    # loss weight schedules resume from the correct position after checkpoint restore.
-    model_bundle.training_step.set_value(jnp.array(trainer._train_steps, dtype=jnp.int32))  # pylint: disable=protected-access
+      # 6. Configure Input Mapping
+      def custom_gen_model_input_fn(batch):
+        inputs_dict = {
+            "input_tokens": batch.input_tokens,
+            "positions": batch.positions,
+            "attention_mask": batch.input_mask,
+            "decoder_segment_ids": batch.decoder_segment_ids,
+            "targets": batch.targets,  # Passed to strategy (labels_fn)
+            "targets_position": batch.targets_position,  # Passed to strategy (labels_fn)
+            "targets_segmentation": batch.targets_segmentation,  # Passed to strategy (labels_fn)
+            "cache": None,
+        }
+        # If we are in online mode then we exit
+        if getattr(batch, "top_k_logits", None) is None:
+          return inputs_dict
 
-    # 6. Configure Input Mapping
-    def custom_gen_model_input_fn(batch):
-      inputs_dict = {
-          "input_tokens": batch.input_tokens,
-          "positions": batch.positions,
-          "attention_mask": batch.input_mask,
-          "decoder_segment_ids": batch.decoder_segment_ids,
-          "targets": batch.targets,  # Passed to strategy (labels_fn)
-          "targets_position": batch.targets_position,  # Passed to strategy (labels_fn)
-          "targets_segmentation": batch.targets_segmentation,  # Passed to strategy (labels_fn)
-          "cache": None,
-      }
-      # If we are in online mode then we exit
-      if getattr(batch, "top_k_logits", None) is None:
+        inputs_dict["teacher_output"] = distillation_utils.DistillationForwardOutput(
+            logits=batch.top_k_logits, out_projection_activations=None, top_k_indices=batch.top_k_indices
+        )
         return inputs_dict
 
-      inputs_dict["teacher_output"] = distillation_utils.DistillationForwardOutput(
-          logits=batch.top_k_logits, out_projection_activations=None, top_k_indices=batch.top_k_indices
-      )
-      return inputs_dict
+      trainer = trainer.with_gen_model_input_fn(custom_gen_model_input_fn)
+      trainer.with_training_hooks(GoodputTrainingHooks(student_config, goodput_recorder))
 
-    trainer = trainer.with_gen_model_input_fn(custom_gen_model_input_fn)
+      # 7. Create Iterator Wrappers (Use Utils)
+      train_iter: Any = distillation_utils.MaxTextToTunixIterator(raw_train_iter)
+      if isinstance(student_config.steps, int) and isinstance(trainer._train_steps, int):  # pylint: disable=protected-access
+        grad_accum = (
+            student_config.gradient_accumulation_steps
+            if isinstance(student_config.gradient_accumulation_steps, int)
+            else 1
+        )
+        remaining_microsteps = max(0, (student_config.steps - trainer._train_steps) * grad_accum)  # pylint: disable=protected-access
+        train_iter = itertools.islice(train_iter, remaining_microsteps)
 
-    # 7. Create Iterator Wrappers (Use Utils)
-    train_iter = distillation_utils.MaxTextToTunixIterator(raw_train_iter)
-
-    eval_iter = None
-    if raw_eval_iter is not None:
-      max_logging.log("Evaluation iterator successfully initialized.")
-      eval_iter = distillation_utils.MaxTextToTunixIterator(raw_eval_iter)
-    elif student_config.eval_interval > 0:
-      max_logging.log("Warning: eval_interval > 0 but create_data_iterator returned None for eval_iter.")
+      eval_iter = None
+      if raw_eval_iter is not None:
+        max_logging.log("Evaluation iterator successfully initialized.")
+        eval_iter = distillation_utils.MaxTextToTunixIterator(raw_eval_iter)
+      elif student_config.eval_interval > 0:
+        max_logging.log("Warning: eval_interval > 0 but create_data_iterator returned None for eval_iter.")
 
     # 8. Train
     max_logging.log("Starting Distillation Training...")
@@ -900,7 +959,8 @@ def main(argv: Sequence[str]) -> None:
 
   # 3. Initialize TEACHER Config
   # We isolate the Teacher from Student CLI arguments (like pruning params).
-  teacher_overrides = global_config.teacher_overrides
+  teacher_overrides = dict(global_config.teacher_overrides or {})
+  teacher_overrides.setdefault("distill_beta", global_config.distill_beta)
 
   # Ensure load_parameters_path is set in overrides
   if not is_offline and not teacher_overrides.get("load_parameters_path"):

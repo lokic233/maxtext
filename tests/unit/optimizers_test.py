@@ -13,24 +13,26 @@
 # limitations under the License.
 
 """Unit tests for all optimizers."""
+
 import re
+from typing import NamedTuple
 import unittest
-from unittest.mock import patch, MagicMock
-import jax
-import optax
-import jax.numpy as jnp
+from unittest.mock import MagicMock, patch
 
-import pytest
-from absl.testing import parameterized
+from absl.testing import absltest, parameterized
 from flax import nnx
-from optax.contrib import MuonDimensionNumbers as mdn
-
+import jax
+import jax.numpy as jnp
+from maxtext.common.common_types import UntrainableParam
 from maxtext.configs import pyconfig
 from maxtext.optimizers import optimizers
+from maxtext.optimizers.muon import ShardedMuonDimensionNumbers as smdn
 from maxtext.utils import maxtext_utils, muon_utils
 from tests.utils.test_helpers import get_test_config_path
-from typing import NamedTuple
-
+import numpy as np
+import optax
+from optax.contrib._muon import MuonDimensionNumbers as mdn
+import pytest
 
 # deepseek2, specific: q_lora_rank=0
 # applicable: deepseek2-16, but not deepseek2-236b (q_lora_rank=1536)
@@ -218,7 +220,6 @@ QWEN3_DIMENSION_NUMBER = {
     }
 }
 
-
 # qwen3 MoE (e.g. qwen3-30b-a3b)
 QWEN3_MOE_DIMENSION_NUMBER = {
     "params": {
@@ -226,7 +227,7 @@ QWEN3_MOE_DIMENSION_NUMBER = {
             "decoder_norm": {"scale": None},
             "layers": {
                 "moe_block": {
-                    "gate": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
+                    "gate": {"kernel": mdn((0,), (-1,))},
                     "wi_0": mdn(reduction_axis=(-2,), output_axis=(-1,)),
                     "wi_1": mdn(reduction_axis=(-2,), output_axis=(-1,)),
                     "wo": mdn(reduction_axis=(-2,), output_axis=(-1,)),
@@ -258,7 +259,7 @@ QWEN3_CUSTOM_MOE_DIMENSION_NUMBER = {
                 "latent_norm": {"scale": None},
                 "layer_up_projection": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
                 "moe_block": {
-                    "gate": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
+                    "gate": {"kernel": mdn((0,), (-1,))},
                     "wi_0": mdn(reduction_axis=(-2,), output_axis=(-1,)),
                     "wi_1": mdn(reduction_axis=(-2,), output_axis=(-1,)),
                     "wo": mdn(reduction_axis=(-2,), output_axis=(-1,)),
@@ -284,7 +285,7 @@ QWEN3_CUSTOM_MOE_DIMENSION_NUMBER = {
 # qwen3-next (e.g. qwen3-next-80b-a3b)
 _QWEN3_NEXT_MLP = {
     "routed_experts": {
-        "gate": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
+        "gate": {"kernel": mdn((0,), (-1,))},
         "wi_0": mdn(reduction_axis=(-2,), output_axis=(-1,)),
         "wi_1": mdn(reduction_axis=(-2,), output_axis=(-1,)),
         "wo": mdn(reduction_axis=(-2,), output_axis=(-1,)),
@@ -332,15 +333,18 @@ _QWEN3_NEXT_FULL_ATTN_LAYER = {
     "post_attention_layernorm": {"scale": None},
 }
 
+# A scanned Qwen3-Next block covers one `inhomogeneous_layer_cycle_interval` period: the
+# linear-attention layers are homogeneous and stacked into `local_layers`, and the single
+# trailing full-attention layer is `global_layer`. The dimension numbers themselves are
+# unchanged by that stacking -- `transform_logic` keys off the parameter path, and the scan
+# axes go in at `param_scan_axis`, which shifts neither axis 0 nor the negative axes.
 QWEN3_NEXT_DIMENSION_NUMBER = {
     "params": {
         "decoder": {
             "decoder_norm": {"scale": None},
             "layers": {
-                "layer_0": _QWEN3_NEXT_GDN_LAYER,
-                "layer_1": _QWEN3_NEXT_GDN_LAYER,
-                "layer_2": _QWEN3_NEXT_GDN_LAYER,
-                "layer_3": _QWEN3_NEXT_FULL_ATTN_LAYER,
+                "local_layers": _QWEN3_NEXT_GDN_LAYER,
+                "global_layer": _QWEN3_NEXT_FULL_ATTN_LAYER,
             },
             "logits_dense": {"kernel": None},
         },
@@ -351,15 +355,27 @@ QWEN3_NEXT_DIMENSION_NUMBER = {
 
 # gpt-oss (e.g. gpt-oss-20b)
 _GPT_OSS_ATTENTION = {
-    "query": {"kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1)), "bias": None},
-    "key": {"kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1)), "bias": None},
-    "value": {"kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1)), "bias": None},
-    "out": {"kernel": mdn(reduction_axis=(0, -2), output_axis=(-1,)), "bias": None},
+    "query": {
+        "kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1)),
+        "bias": None,
+    },
+    "key": {
+        "kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1)),
+        "bias": None,
+    },
+    "value": {
+        "kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1)),
+        "bias": None,
+    },
+    "out": {
+        "kernel": mdn(reduction_axis=(0, -2), output_axis=(-1,)),
+        "bias": None,
+    },
     "sinks": None,
 }
 
 _GPT_OSS_MLP = {
-    "gate": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,)), "bias": None},
+    "gate": {"kernel": mdn((0,), (-1,)), "bias": None},
     "wi_0": mdn(reduction_axis=(-2,), output_axis=(-1,)),
     "wi_0_bias": None,
     "wi_1": mdn(reduction_axis=(-2,), output_axis=(-1,)),
@@ -391,20 +407,7 @@ GPT_OSS_DIMENSION_NUMBER = {
 
 
 # deepseek4 building blocks
-_DEEPSEEK4_MHC_ATTENTION = {
-    "mhc_norm": {"scale": None},
-    "post_alpha": mdn(reduction_axis=(0,), output_axis=(-1,)),
-    "post_alpha_scale": None,
-    "post_beta": None,
-    "pre_alpha": mdn(reduction_axis=(0,), output_axis=(-1,)),
-    "pre_alpha_scale": None,
-    "pre_beta": None,
-    "res_alpha": mdn(reduction_axis=(0,), output_axis=(-1,)),
-    "res_alpha_scale": None,
-    "res_beta": None,
-}
-
-_DEEPSEEK4_MHC_MLP = {
+_DEEPSEEK4_MHC = {
     "mhc_norm": {"scale": None},
     "post_alpha": mdn(reduction_axis=(0,), output_axis=(-1,)),
     "post_alpha_scale": None,
@@ -419,7 +422,7 @@ _DEEPSEEK4_MHC_MLP = {
 
 _DEEPSEEK4_MLP = {
     "MoeBlock_0": {
-        "gate": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
+        "gate": {"kernel": mdn((0,), (-1,))},
         "wi_0": mdn(reduction_axis=(-2,), output_axis=(-1,)),
         "wi_1": mdn(reduction_axis=(-2,), output_axis=(-1,)),
         "wo": mdn(reduction_axis=(-2,), output_axis=(-1,)),
@@ -487,8 +490,8 @@ _DEEPSEEK4_ATTN_HCA = {
 }
 
 _DEEPSEEK4_LAYER_BASIC = {
-    "mhc_attention": _DEEPSEEK4_MHC_ATTENTION,
-    "mhc_mlp": _DEEPSEEK4_MHC_MLP,
+    "mhc_attention": _DEEPSEEK4_MHC,
+    "mhc_mlp": _DEEPSEEK4_MHC,
     "mlp": _DEEPSEEK4_MLP,
     "post_self_attention_layer_norm": {"scale": None},
     "pre_self_attention_layer_norm": {"scale": None},
@@ -496,8 +499,8 @@ _DEEPSEEK4_LAYER_BASIC = {
 }
 
 _DEEPSEEK4_LAYER_CSA_PREFIX = {
-    "mhc_attention": _DEEPSEEK4_MHC_ATTENTION,
-    "mhc_mlp": _DEEPSEEK4_MHC_MLP,
+    "mhc_attention": _DEEPSEEK4_MHC,
+    "mhc_mlp": _DEEPSEEK4_MHC,
     "mlp": _DEEPSEEK4_MLP,
     "post_self_attention_layer_norm": {"scale": None},
     "pre_self_attention_layer_norm": {"scale": None},
@@ -505,8 +508,8 @@ _DEEPSEEK4_LAYER_CSA_PREFIX = {
 }
 
 _DEEPSEEK4_LAYER_CSA_SCANNED = {
-    "mhc_attention": _DEEPSEEK4_MHC_ATTENTION,
-    "mhc_mlp": _DEEPSEEK4_MHC_MLP,
+    "mhc_attention": _DEEPSEEK4_MHC,
+    "mhc_mlp": _DEEPSEEK4_MHC,
     "mlp": _DEEPSEEK4_MLP_SCANNED,
     "post_self_attention_layer_norm": {"scale": None},
     "pre_self_attention_layer_norm": {"scale": None},
@@ -514,8 +517,8 @@ _DEEPSEEK4_LAYER_CSA_SCANNED = {
 }
 
 _DEEPSEEK4_LAYER_HCA_SCANNED = {
-    "mhc_attention": _DEEPSEEK4_MHC_ATTENTION,
-    "mhc_mlp": _DEEPSEEK4_MHC_MLP,
+    "mhc_attention": _DEEPSEEK4_MHC,
+    "mhc_mlp": _DEEPSEEK4_MHC,
     "mlp": _DEEPSEEK4_MLP_SCANNED,
     "post_self_attention_layer_norm": {"scale": None},
     "pre_self_attention_layer_norm": {"scale": None},
@@ -544,6 +547,37 @@ DEEPSEEK4_DIMENSION_NUMBER = {
     }
 }
 
+_DEEPSEEK4_LAYER_HCA_PREFIX = {
+    "mhc_attention": _DEEPSEEK4_MHC,
+    "mhc_mlp": _DEEPSEEK4_MHC,
+    "mlp": _DEEPSEEK4_MLP,
+    "post_self_attention_layer_norm": {"scale": None},
+    "pre_self_attention_layer_norm": {"scale": None},
+    "self_attention": _DEEPSEEK4_ATTN_HCA,
+}
+
+DEEPSEEK4_1600B_DIMENSION_NUMBER = {
+    "params": {
+        "decoder": {
+            "decoder_norm": {"scale": None},
+            "hc_head": {
+                "hc_base": None,
+                "hc_fn": mdn(reduction_axis=(0,), output_axis=(-1,)),
+                "hc_scale": None,
+            },
+            "layers_0": _DEEPSEEK4_LAYER_HCA_PREFIX,
+            "layers_1": _DEEPSEEK4_LAYER_HCA_PREFIX,
+            "layers_2": _DEEPSEEK4_LAYER_CSA_PREFIX,
+            "logits_dense": {"kernel": None},
+            "scanned_blocks": {
+                "layers_0": _DEEPSEEK4_LAYER_HCA_SCANNED,
+                "layers_1": _DEEPSEEK4_LAYER_CSA_SCANNED,
+            },
+        },
+        "token_embedder": {"embedding": None},
+    }
+}
+
 
 class MuonDimensionTest(parameterized.TestCase):
   """Unit tests for Muon dimension number generation.
@@ -556,6 +590,7 @@ class MuonDimensionTest(parameterized.TestCase):
       ("deepseek2-16b", "deepseek2-16b", DEEPSEEK2_DIMENSION_NUMBER),
       ("deepseek3-671b", "deepseek3-671b", DEEPSEEK3_DIMENSION_NUMBER),
       ("deepseek4-284b", "deepseek4-284b", DEEPSEEK4_DIMENSION_NUMBER),
+      ("deepseek4-1600b", "deepseek4-1600b", DEEPSEEK4_1600B_DIMENSION_NUMBER),
       ("kimi-k2-1t", "kimi-k2-1t", DEEPSEEK3_DIMENSION_NUMBER),
       ("llama2-7b", "llama2-7b", LLAMA2_DIMENSION_NUMBER),
       ("llama3-8b", "llama3-8b", LLAMA2_DIMENSION_NUMBER),
@@ -574,12 +609,8 @@ class MuonDimensionTest(parameterized.TestCase):
     Initializes the specified MaxText model and asserts that the generated
     Muon dimension numbers match the hardcoded reference.
     """
-    is_pure_nnx = model_name in {"deepseek4-284b"}
-    actual_output = muon_utils.get_model_mdn(model_name, scan_layers=True, pure_nnx=is_pure_nnx)
-    if "params" in expected_output and "params" in actual_output:
-      self.assertEqual(actual_output["params"], expected_output["params"])
-    else:
-      self.assertEqual(actual_output, expected_output)
+    actual_output = muon_utils.get_model_mdn(model_name, scan_layers=True)
+    self.assertEqual(actual_output, expected_output)
 
 
 class AdamWMaskTest(parameterized.TestCase):
@@ -636,10 +667,10 @@ class AdamWMaskTest(parameterized.TestCase):
     self.assertFalse(mask.bias)
 
   @parameterized.named_parameters(
-      ("adamw", "adamw", "maxtext.optimizers.optimizers.optax.adamw"),
-      ("adam_pax", "adam_pax", "maxtext.optimizers.optimizers.adam_pax"),
+      ("adamw", "adamw", optimizers.optax, "adamw"),
+      ("adam_pax", "adam_pax", optimizers, "adam_pax"),
   )
-  def test_optimizer_with_mask(self, opt_type, mock_path):
+  def test_optimizer_with_mask(self, opt_type, mock_target, mock_attr):
     """Test that optimizer receives the mask function from config and it works as expected"""
     # Create a config with a mask list including regex
     argv = [
@@ -652,7 +683,7 @@ class AdamWMaskTest(parameterized.TestCase):
     config = pyconfig.initialize(argv)
     learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(config)
 
-    with patch(mock_path) as mock_opt:
+    with patch.object(mock_target, mock_attr) as mock_opt:
       # Call get_optimizer
       optimizers.get_optimizer(config, learning_rate_schedule)
 
@@ -680,16 +711,16 @@ class AdamWMaskTest(parameterized.TestCase):
       self.assertTrue(mask["layer3"][1])
 
   @parameterized.named_parameters(
-      ("adamw", "adamw", "maxtext.optimizers.optimizers.optax.adamw"),
-      ("adam_pax", "adam_pax", "maxtext.optimizers.optimizers.adam_pax"),
+      ("adamw", "adamw", optimizers.optax, "adamw"),
+      ("adam_pax", "adam_pax", optimizers, "adam_pax"),
   )
-  def test_optimizer_without_mask(self, opt_type, mock_path):
+  def test_optimizer_without_mask(self, opt_type, mock_target, mock_attr):
     """Test that optimizer receives None for mask when config is empty"""
     argv = ["", get_test_config_path(), "run_name=test", f"opt_type={opt_type}"]
     config = pyconfig.initialize(argv)
     learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(config)
 
-    with patch(mock_path) as mock_opt:
+    with patch.object(mock_target, mock_attr) as mock_opt:
       # Call get_optimizer
       optimizers.get_optimizer(config, learning_rate_schedule)
 
@@ -803,150 +834,149 @@ class TrainableParametersMaskTest(parameterized.TestCase):
     # When no trainable mask is provided, nothing is frozen by this mechanism
     self.assertFalse(jax.numpy.all(updates["layer1"]["kernel"] == 0))
 
-
-_ADAPTER = "adapter/kernel"
-_BACKBONE = "backbone/kernel"
-_VIT_QUERY = "vision_encoder/layer_0/attention/query/kernel"
-_VIT_WI_0 = "vision_encoder/layer_0/mlp/wi_0/kernel"
-_CLIP_BOUND_NAMES = ("input_min", "input_max", "output_min", "output_max")
-_CLIP_BOUNDS = frozenset(
-    f"vision_encoder/layer_0/{block}/{name}"
-    for block in ("attention/q_clip", "mlp/gate_clip")
-    for name in _CLIP_BOUND_NAMES
-)
-_NON_CLIP = frozenset({_ADAPTER, _BACKBONE, _VIT_QUERY, _VIT_WI_0})
-
-
-def _adapter_backbone_vit_params():
-  """Small params tree: an adapter, a backbone and two Gemma-4 ViT projections carrying scalar clip bounds."""
-
-  def clip():
-    return {n: jnp.asarray(v, jnp.float32) for n, v in zip(_CLIP_BOUND_NAMES, (-2.0, 2.0, -3.0, 3.0))}
-
-  return {
-      "adapter": {"kernel": jnp.ones((2, 2))},
-      "backbone": {"kernel": jnp.ones((2, 2))},
-      "vision_encoder": {
-          "layer_0": {
-              "attention": {"query": {"kernel": jnp.ones((2, 2))}, "q_clip": clip()},
-              "mlp": {"wi_0": {"kernel": jnp.ones((2, 2))}, "gate_clip": clip()},
-          }
-      },
-  }
-
-
-def _leaf_paths(tree):
-  return {jax.tree_util.keystr(p, simple=True, separator="/"): v for p, v in jax.tree_util.tree_leaves_with_path(tree)}
-
-
-def _run_jitted_steps(opt, params, num_steps=2):
-  """Applies `num_steps` jitted optimizer steps with a constant non-zero gradient; returns (params, opt_state)."""
-  grads = jax.tree_util.tree_map(lambda x: jnp.full_like(x, 0.5), params)
-  opt_state = opt.init(params)
-
-  @jax.jit
-  def step(p, s):
-    updates, s = opt.update(grads, s, p)
-    return optax.apply_updates(p, updates), s
-
-  for _ in range(num_steps):
-    params, opt_state = step(params, opt_state)
-  return params, opt_state
-
-
-def _adam_mu_slots(opt_state):
-  """Returns (allocated, masked): param paths with an allocated AdamW `mu` slot vs. an optax.MaskedNode slot."""
-  allocated, masked = set(), set()
-  flat = jax.tree_util.tree_flatten_with_path(opt_state, is_leaf=lambda x: isinstance(x, optax.MaskedNode))[0]
-  for path, leaf in flat:
-    names = [getattr(k, "name", getattr(k, "key", None)) for k in path]
-    if "mu" not in names:
-      continue
-    param_path = "/".join(str(n) for n in names[names.index("mu") + 1 :])
-    (masked if isinstance(leaf, optax.MaskedNode) else allocated).add(param_path)
-  return allocated, masked
-
-
-class TrainableMaskAndClipBoundFreezeTest(parameterized.TestCase):
-  """trainable_parameters_mask (a whitelist) composed with the Gemma-4 ViT clip-bound freeze in get_optimizer.
-
-  Checks the parameters actually updated by jitted AdamW steps (weight decay > 0, so any leaf that is not frozen
-  moves) and the optimizer-state allocation: frozen leaves are routed to optax.set_to_zero() through
-  optax.multi_transform, so they get zero updates and no AdamW moment slots (optax.MaskedNode), while trainable
-  leaves get allocated slots.
-  """
-
-  def _get_optimizer(self, trainable_mask, use_clipped_linears_for_vit):
-    """Builds (config, get_optimizer(config)) for AdamW with weight decay and a constant learning rate of 1.0."""
+  def test_get_optimizer_with_trainable_mask_and_skip_step_on_spikes(self):
+    """get_optimizer keeps opt_state['is_skipped'] at top level when masking parameters."""
     argv = [
         "",
         get_test_config_path(),
-        "run_name=test_trainable_mask_clip_freeze",
-        "opt_type=adamw",
-        "adam_weight_decay=0.1",
-        f"trainable_parameters_mask={trainable_mask}",
-        f"use_clipped_linears_for_vit={use_clipped_linears_for_vit}",
+        "run_name=test_mask_and_skip",
+        "trainable_parameters_mask=['.*indexer.*']",
+        "skip_step_on_spikes=True",
+        "skip_step_interval=4",
+        "skip_step_scaling_factor=1.0",
     ]
     config = pyconfig.initialize(argv)
-    return config, optimizers.get_optimizer(config, lambda step: 1.0)
+    opt = optimizers.get_optimizer(config, lambda _: 1.0)
 
-  def _assert_trained_exactly(self, opt, expected_trainable):
-    params = _adapter_backbone_vit_params()
-    new_params, opt_state = _run_jitted_steps(opt, params)
-    before, after = _leaf_paths(params), _leaf_paths(new_params)
-    self.assertEqual(set(before), _NON_CLIP | _CLIP_BOUNDS)
-    changed = {k for k in before if not jnp.array_equal(before[k], after[k])}
-    self.assertEqual(changed, set(expected_trainable))
-    allocated, masked = _adam_mu_slots(opt_state)
-    self.assertEqual(allocated, set(expected_trainable))
-    self.assertEqual(masked, set(before) - set(expected_trainable))
+    params = {"indexer": jnp.ones((2, 2)), "kernel": jnp.ones((2, 2))}
+    grads = {"indexer": jnp.ones((2, 2)) * 0.5, "kernel": jnp.ones((2, 2)) * 0.5}
+    opt_state = opt.init(params)
 
-  def test_whitelist_trains_only_matching_params(self):
-    """use_clipped_linears_for_vit=False: only whitelisted leaves train (the pre-existing whitelist contract)."""
-    _, opt = self._get_optimizer(["adapter"], False)
-    self._assert_trained_exactly(opt, {_ADAPTER})
+    self.assertIsInstance(opt_state, dict)
+    self.assertIn("is_skipped", opt_state)
+    self.assertIsInstance(opt_state["inner_state"], optax.PartitionState)
+    inner_states = opt_state["inner_state"].inner_states
+    self.assertIsInstance(inner_states["frozen"], optax.MaskedState)
+    self.assertIsInstance(inner_states["frozen"].inner_state, optax.EmptyState)
+    self.assertIsInstance(inner_states["trainable"], optax.MaskedState)
+    self.assertIsInstance(inner_states["trainable"].inner_state[0].mu["kernel"], optax.MaskedNode)
+
+    normal_kwargs = {"loss": jnp.array(1.0), "grad_norm": jnp.array(1.0)}
+    for _ in range(2):
+      updates, opt_state = opt.update(grads, opt_state, params, **normal_kwargs)
+      self.assertFalse(bool(opt_state["is_skipped"]))
+      self.assertFalse(bool(jnp.all(updates["indexer"] == 0)))
+      self.assertTrue(bool(jnp.all(updates["kernel"] == 0)))
+
+    spike_kwargs = {"loss": jnp.array(100.0), "grad_norm": jnp.array(1.0)}
+    updates, opt_state = opt.update(grads, opt_state, params, **spike_kwargs)
+    self.assertTrue(bool(opt_state["is_skipped"]))
+    self.assertTrue(bool(jnp.all(updates["indexer"] == 0)))
+    self.assertTrue(bool(jnp.all(updates["kernel"] == 0)))
+
+  def test_apply_trainable_parameters_mask_warns_on_empty_or_full_freeze(self):
+    """apply_trainable_parameters_mask logs warnings at WARNING level when 0 or all params freeze."""
+    params = {"indexer": jnp.ones((2, 2)), "kernel": jnp.ones((2, 2))}
+
+    cfg_none_frozen = pyconfig.initialize(
+        ["", get_test_config_path(), "run_name=test_warn_none", "trainable_parameters_mask=['.*']"]
+    )
+    opt_none_frozen = optimizers.apply_trainable_parameters_mask(optax.sgd(0.1), cfg_none_frozen)
+    with patch.object(optimizers.max_logging, "warning") as mock_warning:
+      opt_none_frozen.init(params)
+      mock_warning.assert_called_once()
+      self.assertIn("froze nothing", mock_warning.call_args[0][0])
+
+    cfg_all_frozen = pyconfig.initialize(
+        ["", get_test_config_path(), "run_name=test_warn_all", "trainable_parameters_mask=['nonexistent']"]
+    )
+    opt_all_frozen = optimizers.apply_trainable_parameters_mask(optax.sgd(0.1), cfg_all_frozen)
+    with patch.object(optimizers.max_logging, "warning") as mock_warning:
+      opt_all_frozen.init(params)
+      mock_warning.assert_called_once()
+      self.assertIn("froze EVERY parameter", mock_warning.call_args[0][0])
+
+
+class _WeightDecayModel(nnx.Module):
+  """Names follow the Muon rules: `kernel` is a matrix, `scale` is excluded from Muon."""
+
+  def __init__(self):
+    layer = nnx.Dict(kernel=nnx.Param(jnp.ones((2, 2))), frozen_kernel=UntrainableParam(jnp.ones((2, 2))))
+    self.decoder = nnx.Dict(layer=layer)
+    self.bound_scale = UntrainableParam(jnp.asarray(3.0, jnp.float32))
+
+
+class UntrainableParamWeightDecayTest(parameterized.TestCase):
+  """Zero gradients leave weight decay as the only force on a weight, so only a real freeze holds it in place."""
+
+  def _config(self, *extra):
+    argv = ["", get_test_config_path(), "run_name=test_untrainable_decay", "adam_weight_decay=0.5", *extra]
+    return pyconfig.initialize(argv)
+
+  def _apply_zero_grads(self, model, tx):
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+    optimizer.update(model, jax.tree_util.tree_map(jnp.zeros_like, nnx.state(model, nnx.Param)))
+    return optimizer
+
+  def _assert_untrainable_unchanged(self, model, optimizer, kernel_moved=True):
+    self.assertEqual(kernel_moved, not jnp.array_equal(model.decoder.layer.kernel[...], jnp.ones((2, 2))))
+    self.assertTrue(jnp.array_equal(model.decoder.layer.frozen_kernel[...], jnp.ones((2, 2))))
+    self.assertEqual(float(model.bound_scale[...]), 3.0)
+    slots = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(nnx.state(optimizer))]
+    self.assertEqual(kernel_moved, bool([s for s in slots if "'kernel'" in s]), slots)
+    self.assertFalse([s for s in slots if "frozen_kernel" in s or "bound_scale" in s], slots)
 
   @parameterized.named_parameters(
-      ("adapter_only", ["adapter"], {_ADAPTER}),
-      ("whitelist_covers_vit", ["adapter", "vision_encoder"], {_ADAPTER, _VIT_QUERY, _VIT_WI_0}),
-      ("whitelist_names_clip_bounds", ["adapter", "_clip"], {_ADAPTER}),
+      ("adamw", "opt_type=adamw"),
+      ("adam_pax", "opt_type=adam_pax"),
   )
-  def test_whitelist_with_clip_freeze(self, trainable_mask, expected_trainable):
-    """Whitelisted leaves train, the rest stay frozen, and clip bounds stay frozen even when whitelisted."""
-    _, opt = self._get_optimizer(trainable_mask, True)
-    self._assert_trained_exactly(opt, expected_trainable)
+  def test_adam_weight_decay_skips_untrainable(self, opt_type):
+    model = _WeightDecayModel()
+    tx = optimizers.get_optimizer(self._config(opt_type), lambda step: 1.0, model)
+    self._assert_untrainable_unchanged(model, self._apply_zero_grads(model, tx))
 
-  def test_clip_freeze_without_whitelist(self):
-    """No whitelist: everything trains except the clip bounds."""
-    _, opt = self._get_optimizer([], True)
-    self._assert_trained_exactly(opt, _NON_CLIP)
+  def test_muon_weight_decay_skips_untrainable(self):
+    model = _WeightDecayModel()
+    config = self._config("opt_type=muon", "muon_type=maxtext_muon", "muon_weight_decay=0.5")
+    tx = optimizers.get_optimizer(config, lambda step: 1.0, model)
+    self._assert_untrainable_unchanged(model, self._apply_zero_grads(model, tx))
 
-  def test_both_flags_off_returns_unwrapped_optimizer(self):
-    """No whitelist and no clip freeze: get_optimizer returns the base optimizer unwrapped; every leaf trains."""
-    _, opt = self._get_optimizer([], False)
-    params = _adapter_backbone_vit_params()
-    self.assertNotIsInstance(opt.init(params), optax.PartitionState)
-    new_params, _ = _run_jitted_steps(opt, params)
-    before, after = _leaf_paths(params), _leaf_paths(new_params)
-    self.assertTrue(all(not jnp.array_equal(before[k], after[k]) for k in before))
+  @parameterized.named_parameters(
+      ("whitelist_names_untrainable", "trainable_parameters_mask=['kernel','bound_scale']", True),
+      ("whitelist_excludes_everything_else", "trainable_parameters_mask=['bound_scale']", False),
+  )
+  def test_trainable_parameters_mask_cannot_unfreeze(self, mask, kernel_moved):
+    model = _WeightDecayModel()
+    tx = optimizers.get_optimizer(self._config("opt_type=adamw", mask), lambda step: 1.0, model)
+    self._assert_untrainable_unchanged(model, self._apply_zero_grads(model, tx), kernel_moved)
 
-  def test_whitelist_without_clip_freeze_matches_original_composition(self):
-    """use_clipped_linears_for_vit=False: the whitelist-only optimizer equals its definition prior to the clip freeze."""
-    patterns = ["adapter"]
-    config, opt = self._get_optimizer(patterns, False)
-    _, base_opt = self._get_optimizer([], False)
-    self.assertFalse(config.use_clipped_linears_for_vit)
-    freeze_mask_fn = optimizers._get_path_mask_fn(patterns, match_returns_true=False)  # pylint: disable=protected-access
-    reference = optax.multi_transform(
-        {"trainable": base_opt, "frozen": optax.set_to_zero()},
-        lambda p: jax.tree_util.tree_map(lambda x: "frozen" if x else "trainable", freeze_mask_fn(p)),
-    )
-    params = _adapter_backbone_vit_params()
-    got = _run_jitted_steps(opt, params)
-    ref = _run_jitted_steps(reference, params)
-    self.assertEqual(jax.tree_util.tree_structure(got), jax.tree_util.tree_structure(ref))
-    for got_leaf, ref_leaf in zip(jax.tree_util.tree_leaves(got), jax.tree_util.tree_leaves(ref)):
-      self.assertTrue(jnp.array_equal(got_leaf, ref_leaf))
+  def test_frozen_paths_survive_inject_hyperparams(self):
+    model = _WeightDecayModel()
+    config = self._config("opt_type=adamw")
+    frozen_paths = optimizers.untrainable_paths(model)
+
+    def factory(learning_rate):
+      return optimizers.get_optimizer(config, learning_rate, frozen_paths=frozen_paths)
+
+    tx = optax.inject_hyperparams(factory)(learning_rate=1.0)
+    self._assert_untrainable_unchanged(model, self._apply_zero_grads(model, tx))
+
+  def test_no_untrainable_params_leaves_optimizer_state_unchanged(self):
+    params = {"kernel": jnp.ones((2, 2))}
+    config = self._config("opt_type=adamw")
+    wrapped = optimizers.get_optimizer(config, lambda step: 1.0, nnx.Dict(kernel=nnx.Param(jnp.ones((2, 2)))))
+    plain = optimizers.get_optimizer(config, lambda step: 1.0)
+    self.assertEqual(jax.tree_util.tree_structure(wrapped.init(params)), jax.tree_util.tree_structure(plain.init(params)))
+
+  def test_untrainable_param_without_freeze_raises_at_init(self):
+    model = _WeightDecayModel()
+    tx = optimizers.get_optimizer(self._config("opt_type=adamw"), lambda step: 1.0)
+    with self.assertRaisesRegex(ValueError, "UntrainableParam weights would be trained"):
+      nnx.Optimizer(model, tx, wrt=nnx.Param)
+
+  def test_untrainable_paths_is_empty_for_none_and_models_without_them(self):
+    self.assertEqual(optimizers.untrainable_paths(None), frozenset())
+    self.assertEqual(optimizers.untrainable_paths(nnx.Dict(kernel=nnx.Param(jnp.ones(1)))), frozenset())
 
 
 class SkipStepOnSpikesTest(parameterized.TestCase):
@@ -1001,6 +1031,65 @@ class SkipStepOnSpikesTest(parameterized.TestCase):
     # Count shouldn't have incremented
     self.assertEqual(opt_state["count"], 0)
 
+  def test_skip_step_on_nan_loss_warmup(self):
+    inner_opt = optax.sgd(0.1)
+    opt = optimizers.skip_step_on_spikes(inner_opt, interval=4, scaling_factor=1.0)
+    params = {"x": jnp.array([1.0])}
+    opt_state = opt.init(params)
+
+    # Step 0 with NaN loss during warmup must be skipped
+    updates, opt_state = opt.update({"x": jnp.array([1.0])}, opt_state, params, loss=jnp.nan, grad_norm=jnp.float32(1.0))
+    self.assertTrue(jnp.all(updates["x"] == 0.0))
+    self.assertTrue(opt_state["is_skipped"])
+    self.assertEqual(opt_state["count"], 0)
+    self.assertFalse(jnp.any(jnp.isnan(opt_state["losses"])))
+
+  def test_skip_step_on_nan_grad_norm_warmup(self):
+    inner_opt = optax.sgd(0.1)
+    opt = optimizers.skip_step_on_spikes(inner_opt, interval=4, scaling_factor=1.0)
+    params = {"x": jnp.array([1.0])}
+    opt_state = opt.init(params)
+
+    # Step 0 with NaN grad_norm during warmup must be skipped
+    updates, opt_state = opt.update({"x": jnp.array([1.0])}, opt_state, params, loss=jnp.float32(1.0), grad_norm=jnp.nan)
+    self.assertTrue(jnp.all(updates["x"] == 0.0))
+    self.assertTrue(opt_state["is_skipped"])
+    self.assertEqual(opt_state["count"], 0)
+    self.assertFalse(jnp.any(jnp.isnan(opt_state["grad_norms"])))
+
+  def test_nan_does_not_poison_rolling_buffer(self):
+    inner_opt = optax.sgd(0.1)
+    opt = optimizers.skip_step_on_spikes(inner_opt, interval=4, scaling_factor=1.0)
+    params = {"x": jnp.array([1.0])}
+    opt_state = opt.init(params)
+
+    # Step 0: NaN occurs
+    updates, opt_state = opt.update({"x": jnp.array([1.0])}, opt_state, params, loss=jnp.nan, grad_norm=jnp.nan)
+    self.assertTrue(opt_state["is_skipped"])
+    self.assertEqual(opt_state["count"], 0)
+
+    # Step 1: Normal step succeeds
+    updates, opt_state = opt.update(
+        {"x": jnp.array([1.0])}, opt_state, params, loss=jnp.float32(1.0), grad_norm=jnp.float32(1.0)
+    )
+    self.assertFalse(opt_state["is_skipped"])
+    self.assertEqual(opt_state["count"], 1)
+    self.assertFalse(jnp.all(updates["x"] == 0.0))
+
+    # Step 2: Normal step succeeds
+    updates, opt_state = opt.update(
+        {"x": jnp.array([1.0])}, opt_state, params, loss=jnp.float32(1.0), grad_norm=jnp.float32(1.0)
+    )
+    self.assertFalse(opt_state["is_skipped"])
+    self.assertEqual(opt_state["count"], 2)
+
+    # Step 3: Spike is properly detected because rolling stats are finite
+    updates, opt_state = opt.update(
+        {"x": jnp.array([1.0])}, opt_state, params, loss=jnp.float32(100.0), grad_norm=jnp.float32(1.0)
+    )
+    self.assertTrue(opt_state["is_skipped"])
+    self.assertTrue(jnp.all(updates["x"] == 0.0))
+
 
 class TestMuonLogic(unittest.TestCase):
   """Tests the granular path transformation functions."""
@@ -1021,6 +1110,14 @@ class TestMuonLogic(unittest.TestCase):
     result = muon_utils.transform_logic(path)
     self.assertEqual(result.reduction_axis, (-2,))
     self.assertEqual(result.output_axis, (-1,))
+
+  def test_transform_logic_moe_routers(self):
+    path = ("layers_0", "MoeBlock_0", "gate", "kernel")
+    self.assertEqual(muon_utils.transform_logic(path, include_routers=True), mdn((0,), (-1,)))
+    self.assertIsNone(muon_utils.transform_logic(path, include_routers=False))
+
+    path_expert = ("layers_0", "MoeBlock_0", "wi_0")
+    self.assertEqual(muon_utils.transform_logic(path_expert, include_routers=False), mdn((-2,), (-1,)))
 
   def test_transform_logic_attention(self):
     path_out = ("layers_0", "self_attention", "out", "kernel")
@@ -1101,8 +1198,8 @@ class TestMuonLogic(unittest.TestCase):
 
       def __init__(self, rngs: nnx.Rngs):
         self.self_attention = nnx.Module()
-        self.self_attention.query = nnx.Linear(8, 8, rngs=rngs)
-        self.self_attention.out = nnx.Linear(8, 8, rngs=rngs)
+        self.self_attention.query = nnx.Param(jnp.ones((8, 4, 2)))
+        self.self_attention.out = nnx.Param(jnp.ones((4, 2, 8)))
 
     # Use eval_shape to create an abstract version of the model.
     model = nnx.eval_shape(lambda: DeepSeekAttention(nnx.Rngs(0)))
@@ -1110,53 +1207,190 @@ class TestMuonLogic(unittest.TestCase):
     result = muon_utils.get_muon_weight_dimension_numbers(model, config)
 
     # Check attention query: [0] -> [-2, -1]
-    self.assertEqual(result.self_attention.query.kernel, mdn((0,), (-2, -1)))
+    self.assertEqual(result.self_attention.query, mdn((0,), (-2, -1)))
     # Check attention out: [0, -2] -> [-1]
-    self.assertEqual(result.self_attention.out.kernel, mdn((0, -2), (-1,)))
+    self.assertEqual(result.self_attention.out, mdn((0, -2), (-1,)))
 
   def test_muon_newton_schulz_config(self):
-    """Verifies that muon optimizer configures Newton-Schulz parameters correctly based on model."""
+    """Verifies that muon optimizer configures Newton-Schulz parameters correctly based on model and muon_type."""
     model = MagicMock()
+    mesh = MagicMock()
     learning_rate_schedule = MagicMock()
 
-    # Case 1: DeepSeek4 Model (Auto-configures 10-step schedule)
+    # Case 1: DeepSeek4 Model with MaxText Muon (Auto-configures 10-step schedule)
     argv_ds4 = [
         "",
         get_test_config_path(),
         "run_name=test",
         "opt_type=muon",
+        "muon_type=maxtext_muon",
         "model_name=deepseek4-284b",
         "attention=dot_product",
+        "muon_use_all_to_all=True",
     ]
     config_ds4 = pyconfig.initialize(argv_ds4)
 
     with (
-        patch("maxtext.optimizers.optimizers.get_muon_weight_dimension_numbers") as mock_get_mdn,
-        patch("maxtext.optimizers.optimizers.muon") as mock_muon,
+        patch.object(optimizers, "get_maxtext_muon_weight_dimension_numbers") as mock_get_smdn,
+        patch.object(optimizers, "maxtext_muon") as mock_maxtext_muon,
     ):
-      mock_get_mdn.return_value = {}
-      optimizers.get_optimizer(config_ds4, learning_rate_schedule, model=model)
-      mock_muon.assert_called_once()
-      _, kwargs = mock_muon.call_args
+      mock_get_smdn.return_value = {"params": {"w": smdn((0,), (-1,))}}
+      optimizers.get_optimizer(config_ds4, learning_rate_schedule, model=model, mesh=mesh)
+      mock_get_smdn.assert_called_once_with(model, config_ds4, mesh=mesh)
+      mock_maxtext_muon.assert_called_once()
+      _, kwargs = mock_maxtext_muon.call_args
       self.assertEqual(kwargs["ns_steps"], 10)
       self.assertEqual(len(kwargs["ns_coeffs"]), 10)
       self.assertEqual(kwargs["ns_coeffs"][-1], (2.0, -1.5, 0.5))
+      self.assertEqual(kwargs["muon_weight_dimension_numbers"], mock_get_smdn.return_value)
+      self.assertTrue(kwargs["use_all_to_all"])
 
-    # Case 2: Standard Model (Llama2) (Defaults to 5-step schedule)
-    argv_llama = ["", get_test_config_path(), "run_name=test", "opt_type=muon", "model_name=llama2-7b"]
-    config_llama = pyconfig.initialize(argv_llama)
+    # Case 2: MaxText Muon with use_all_to_all=False
+    argv_no_a2a = [
+        "",
+        get_test_config_path(),
+        "run_name=test",
+        "opt_type=muon",
+        "muon_type=maxtext_muon",
+        "model_name=llama2-7b",
+        "muon_use_all_to_all=False",
+    ]
+    config_no_a2a = pyconfig.initialize(argv_no_a2a)
 
     with (
-        patch("maxtext.optimizers.optimizers.get_muon_weight_dimension_numbers") as mock_get_mdn,
-        patch("maxtext.optimizers.optimizers.muon") as mock_muon,
+        patch.object(optimizers, "get_maxtext_muon_weight_dimension_numbers") as mock_get_smdn,
+        patch.object(optimizers, "maxtext_muon") as mock_maxtext_muon,
     ):
-      mock_get_mdn.return_value = {}
-      optimizers.get_optimizer(config_llama, learning_rate_schedule, model=model)
-      mock_muon.assert_called_once()
-      _, kwargs = mock_muon.call_args
+      mock_get_smdn.return_value = {}
+      optimizers.get_optimizer(config_no_a2a, learning_rate_schedule, model=model)
+      mock_get_smdn.assert_called_once_with(model, config_no_a2a, mesh=None)
+      mock_maxtext_muon.assert_called_once()
+      _, kwargs = mock_maxtext_muon.call_args
       self.assertEqual(kwargs["ns_steps"], 5)
       self.assertEqual(kwargs["ns_coeffs"], (3.4445, -4.7750, 2.0315))
+      self.assertEqual(kwargs["muon_weight_dimension_numbers"], mock_get_smdn.return_value)
+      self.assertFalse(kwargs["use_all_to_all"])
+
+    # Case 3: Default Muon Type (defaults to optax_muon)
+    argv_default = [
+        "",
+        get_test_config_path(),
+        "run_name=test",
+        "opt_type=muon",
+        "model_name=llama2-7b",
+    ]
+    config_default = pyconfig.initialize(argv_default)
+
+    with (
+        patch.object(optimizers, "get_muon_weight_dimension_numbers") as mock_get_mdn,
+        patch.object(optimizers, "optax_muon") as mock_optax_muon,
+    ):
+      mock_get_mdn.return_value = {}
+      optimizers.get_optimizer(config_default, learning_rate_schedule, model=model)
+      mock_get_mdn.assert_called_once_with(model, config_default)
+      mock_optax_muon.assert_called_once()
+      _, kwargs = mock_optax_muon.call_args
+      self.assertEqual(kwargs["ns_steps"], 5)
+      self.assertEqual(kwargs["ns_coeffs"], (3.4445, -4.7750, 2.0315))
+      self.assertEqual(kwargs["muon_weight_dimension_numbers"], mock_get_mdn.return_value)
+      self.assertNotIn("use_all_to_all", kwargs)
+
+    # Case 4: Explicit Optax Muon (muon_type=optax_muon)
+    argv_optax = [
+        "",
+        get_test_config_path(),
+        "run_name=test",
+        "opt_type=muon",
+        "muon_type=optax_muon",
+        "model_name=llama2-7b",
+    ]
+    config_optax = pyconfig.initialize(argv_optax)
+
+    with (
+        patch.object(optimizers, "get_muon_weight_dimension_numbers") as mock_get_mdn,
+        patch.object(optimizers, "optax_muon") as mock_optax_muon,
+    ):
+      mock_get_mdn.return_value = {}
+      optimizers.get_optimizer(config_optax, learning_rate_schedule, model=model)
+      mock_get_mdn.assert_called_once_with(model, config_optax)
+      mock_optax_muon.assert_called_once()
+      _, kwargs = mock_optax_muon.call_args
+      self.assertEqual(kwargs["ns_steps"], 5)
+      self.assertEqual(kwargs["ns_coeffs"], (3.4445, -4.7750, 2.0315))
+      self.assertEqual(kwargs["muon_weight_dimension_numbers"], mock_get_mdn.return_value)
+      self.assertNotIn("use_all_to_all", kwargs)
+
+    # Case 5: Optax Muon with muon_use_all_to_all=True raises AssertionError
+    argv_optax_a2a = [
+        "",
+        get_test_config_path(),
+        "run_name=test",
+        "opt_type=muon",
+        "muon_type=optax_muon",
+        "model_name=llama2-7b",
+        "muon_use_all_to_all=True",
+    ]
+    config_optax_a2a = pyconfig.initialize(argv_optax_a2a)
+    with self.assertRaises(AssertionError):
+      optimizers.get_optimizer(config_optax_a2a, learning_rate_schedule, model=model)
+
+    # Case 6: Invalid muon_type raises ValueError
+    argv_invalid = [
+        "",
+        get_test_config_path(),
+        "run_name=test",
+        "opt_type=muon",
+        "muon_type=invalid_type",
+        "model_name=llama2-7b",
+    ]
+    config_invalid = pyconfig.initialize(argv_invalid)
+    with self.assertRaises(ValueError):
+      optimizers.get_optimizer(config_invalid, learning_rate_schedule, model=model)
+
+  def test_maxtext_muon_wires_named_sharding_and_mesh(self):
+    """Verifies that get_optimizer forwards mesh and propagates ShardedMuonDimensionNumbers with NamedSharding."""
+    devices = np.array(jax.devices()[:1]).reshape((1, 1))
+    mesh = jax.sharding.Mesh(devices, ("data", "model"))
+    sharded_dim_nums = {
+        "params": {
+            "mlp": {
+                "kernel": smdn(
+                    reduction_axis=(0,),
+                    output_axis=(-1,),
+                    sharding=jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", "model")),
+                )
+            }
+        }
+    }
+    model = MagicMock()
+    learning_rate_schedule = MagicMock()
+    argv = [
+        "",
+        get_test_config_path(),
+        "run_name=test",
+        "opt_type=muon",
+        "muon_type=maxtext_muon",
+        "model_name=llama2-7b",
+    ]
+    config = pyconfig.initialize(argv)
+
+    with (
+        patch.object(
+            optimizers, "get_maxtext_muon_weight_dimension_numbers", return_value=sharded_dim_nums
+        ) as mock_get_smdn,
+        patch.object(optimizers, "maxtext_muon") as mock_maxtext_muon,
+    ):
+      optimizers.get_optimizer(config, learning_rate_schedule, model=model, mesh=mesh)
+      mock_get_smdn.assert_called_once_with(model, config, mesh=mesh)
+      mock_maxtext_muon.assert_called_once()
+      _, kwargs = mock_maxtext_muon.call_args
+      passed_dim_nums = kwargs["muon_weight_dimension_numbers"]
+      self.assertEqual(passed_dim_nums, sharded_dim_nums)
+      kernel_spec = passed_dim_nums["params"]["mlp"]["kernel"]
+      self.assertIsInstance(kernel_spec.sharding, jax.sharding.NamedSharding)
+      self.assertEqual(kernel_spec.sharding.mesh, mesh)
+      self.assertEqual(kernel_spec.sharding.spec, jax.sharding.PartitionSpec("data", "model"))
 
 
 if __name__ == "__main__":
-  unittest.main()
+  absltest.main()

@@ -35,6 +35,8 @@ import jax
 from jax import tree_util as jtu
 import qwix
 
+from maxtext.common.common_types import variable_collection_name
+
 M = tp.TypeVar("M", bound=Module)
 
 
@@ -230,6 +232,14 @@ class ToNNX(Module):
   def lazy_init(self, *args, **kwargs):
     """A shortcut of calling `nnx.bridge.lazy_init()` upon this module."""
     return lazy_init(self, *args, **kwargs)
+
+  def release_rngs(self):
+    """Drops the forked ``Rngs`` so it stops being part of the model state.
+
+    Safe only after the wrapped module is initialized, and only if it never calls
+    ``make_rng`` at apply time.
+    """
+    self.to_nnx__rngs = None
 
   def __getattr__(self, name: str):
     if hasattr(super(), name):
@@ -616,7 +626,7 @@ class ToLinen(linen.Module):
     # group state by collection
     for path, leaf in nnx.to_flat_state(state):
       type_ = leaf.type if isinstance(leaf, nnx.Variable) else type(leaf)
-      collection = variablelib.variable_name_from_type(type_, allow_register=True)
+      collection = variable_collection_name(type_)
       if collection not in collection_flat_state:
         collection_flat_state[collection] = []
       collection_flat_state[collection].append((path, leaf))

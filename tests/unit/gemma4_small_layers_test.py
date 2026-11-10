@@ -42,6 +42,7 @@ from maxtext.common.common_types import AttentionType
 from maxtext.layers.attentions import Attention
 from maxtext.models import gemma4_small
 from maxtext.models import gemma4_vision as gv
+from maxtext.optimizers import optimizers
 from maxtext.utils.globals import MAXTEXT_REPO_ROOT
 from tests.utils.multimodal_test_utils import assert_all_close_jax_torch, copy_rmsnorm_weights
 
@@ -51,9 +52,6 @@ from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4TextModel as TorchGemma4TextModel,
     Gemma4TextRotaryEmbedding as TorchGemma4TextRotaryEmbedding,
 )
-
-
-torch.set_grad_enabled(False)
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +228,11 @@ class Gemma4SmallParityBase(unittest.TestCase):
     cls.torch_config = _build_torch_text_config(cls.jax_config)
     cls.torch_config._attn_implementation = "eager"  # pylint: disable=protected-access
     cls.mesh = Mesh(np.array(jax.devices()[:1]), axis_names=("data",))
+
+  def setUp(self):
+    super().setUp()
+    self.addCleanup(torch.set_grad_enabled, torch.is_grad_enabled())
+    torch.set_grad_enabled(False)
 
 
 class TestGemma4SmallPLE(Gemma4SmallParityBase):
@@ -429,6 +432,10 @@ def _finite_cb(in_lo=-2.5, in_hi=2.5, out_lo=-4.0, out_hi=4.0):
 
 class ClipMathTest(unittest.TestCase):
 
+  def test_clip_bounds_are_untrainable_params(self):
+    cb = gv._make_clip_state()  # pylint: disable=protected-access
+    self.assertEqual(optimizers.untrainable_paths(cb), {"input_min", "input_max", "output_min", "output_max"})
+
   def test_clip_in_matches_jnp_clip(self):
     cb = _finite_cb()
     x = (jax.random.normal(jax.random.PRNGKey(0), (5, 17)) * 6.0).astype(jnp.float32)
@@ -450,21 +457,25 @@ class ClipMathTest(unittest.TestCase):
     self.assertEqual(gv._clip_in(x, cb).dtype, jnp.bfloat16)
 
   def test_bounds_are_stop_gradient(self):
-    # The clamp bound is read through jax.lax.stop_gradient at the use-site, so gradient wrt the bound
-    # value is exactly zero even when the clamp is active. Probe _clip_bound_value directly with a
-    # lightweight bound holder to avoid mutating an nnx Param inside a traced function.
-    class _B:
-
-      def __init__(self, v):
-        self.value = v
-
+    # The bounds are UntrainableParam, so the gradient wrt a bound is zero even when the clamp is active.
+    # pylint: disable=protected-access
     def loss(bound_val):
+      cb = gv._make_clip_state()
+      cb.input_min, cb.input_max = gv._mk_clip_bound(-100.0), gv._mk_clip_bound(bound_val)
       x = jnp.ones((4,), jnp.float32) * 10.0  # above the bound -> clamp active
-      hi = gv._clip_bound_value(_B(bound_val), jnp.float32)
-      return jnp.sum(jnp.clip(x, -100.0, hi))
+      return jnp.sum(gv._clip_in(x, cb))
 
     g = jax.grad(loss)(jnp.asarray(2.5, jnp.float32))
     self.assertEqual(float(g), 0.0)
+
+
+class VisionStdTest(unittest.TestCase):
+
+  def test_std_bias_and_std_scale_are_untrainable(self):
+    config = _init_gate_config(["use_clipped_linears_for_vit=true"])
+    mesh = Mesh(np.array(jax.devices()[:1]), axis_names=("data",))
+    encoder = nnx.eval_shape(lambda: gv.Gemma4VisionEncoderLayer(config, mesh, rngs=nnx.Rngs(0)))
+    self.assertLessEqual({"std_bias", "std_scale"}, optimizers.untrainable_paths(encoder))
 
 
 class ValidateBoundsTest(unittest.TestCase):
@@ -491,33 +502,6 @@ class ValidateBoundsTest(unittest.TestCase):
     self.assertIsNone(gv.validate_clip_bounds(None))
 
 
-class FreezeMaskTest(unittest.TestCase):
-
-  def test_freeze_mask_polarity_and_count(self):
-    tree = {
-        "vision_encoder": {
-            "layer_0": {
-                "attention": {
-                    "q_clip": {"input_min": 1.0, "input_max": 1.0, "output_min": 1.0, "output_max": 1.0},
-                    "query": {"kernel": 1.0},
-                },
-                "mlp": {"gate_clip": {"input_min": 1.0, "output_max": 1.0}, "wi_0": {"kernel": 1.0}},
-            }
-        },
-        "decoder": {"layer_0": {"norm": {"scale": 1.0}}},
-    }
-    mask = gv.clip_optimizer_freeze_mask(tree)
-    flat = jax.tree_util.tree_flatten_with_path(mask)[0]
-    n_clip = 0
-    for path, v in flat:
-      is_clip = gv._is_clip_bound_path(path)
-      # clip leaves -> False (frozen); everything else -> True (trainable)
-      self.assertEqual(bool(v), (not is_clip))
-      if is_clip:
-        n_clip += 1
-    self.assertEqual(n_clip, 6)  # q_clip(4) + gate_clip(2)
-
-
 class SymbolsTest(unittest.TestCase):
 
   def test_expected_counts_constants(self):
@@ -527,7 +511,6 @@ class SymbolsTest(unittest.TestCase):
   def test_public_symbols_present(self):
     for sym in (
         "validate_all_vision_clip_bounds",
-        "clip_optimizer_freeze_mask",
         "Gemma4ClippedMlpBlock",
         "Gemma4Attention",
     ):
@@ -632,9 +615,17 @@ class Gemma4MmContractGateTest(unittest.TestCase):
       _init_gate_config(["use_clipped_linears_for_vit=false"])
 
   def test_packing_hard_fails(self):
-    # Packed multimodal is unsupported for E2B/E4B in any mode (cross-doc image attention risk).
-    with self.assertRaises(Exception):
-      _init_gate_config(["use_clipped_linears_for_vit=true", "packing=true"])
+    # Only multimodal SFT loads images; packing there is rejected, as for every multimodal model.
+    with self.assertRaisesRegex(Exception, "packing"):
+      _init_gate_config(
+          ["use_clipped_linears_for_vit=true", "use_sft=true", "sft_train_on_completion_only=true", "packing=true"]
+      )
+
+  def test_text_only_keeps_packing(self):
+    for model in ("gemma4-e2b", "gemma4-e4b"):
+      for packing in ({}, {"packing": True}):
+        config = pyconfig.initialize(["", _BASE_CONFIG_PATH], model_name=model, scan_layers=False, **packing)
+        self.assertTrue(config.packing, msg=f"{model} {packing}")
 
 
 if __name__ == "__main__":
