@@ -53,9 +53,6 @@ from transformers.models.gemma4.modeling_gemma4 import (
 )
 
 
-torch.set_grad_enabled(False)
-
-
 # ---------------------------------------------------------------------------
 # Test config — small E2B-shaped variant, dimensions trimmed to keep tests fast.
 # ---------------------------------------------------------------------------
@@ -230,6 +227,11 @@ class Gemma4SmallParityBase(unittest.TestCase):
     cls.torch_config = _build_torch_text_config(cls.jax_config)
     cls.torch_config._attn_implementation = "eager"  # pylint: disable=protected-access
     cls.mesh = Mesh(np.array(jax.devices()[:1]), axis_names=("data",))
+
+  def setUp(self):
+    super().setUp()
+    self.addCleanup(torch.set_grad_enabled, torch.is_grad_enabled())
+    torch.set_grad_enabled(False)
 
 
 class TestGemma4SmallPLE(Gemma4SmallParityBase):
@@ -632,9 +634,17 @@ class Gemma4MmContractGateTest(unittest.TestCase):
       _init_gate_config(["use_clipped_linears_for_vit=false"])
 
   def test_packing_hard_fails(self):
-    # Packed multimodal is unsupported for E2B/E4B in any mode (cross-doc image attention risk).
-    with self.assertRaises(Exception):
-      _init_gate_config(["use_clipped_linears_for_vit=true", "packing=true"])
+    # Only multimodal SFT loads images; packing there is rejected, as for every multimodal model.
+    with self.assertRaisesRegex(Exception, "packing"):
+      _init_gate_config(
+          ["use_clipped_linears_for_vit=true", "use_sft=true", "sft_train_on_completion_only=true", "packing=true"]
+      )
+
+  def test_text_only_keeps_packing(self):
+    for model in ("gemma4-e2b", "gemma4-e4b"):
+      for packing in ({}, {"packing": True}):
+        config = pyconfig.initialize(["", _BASE_CONFIG_PATH], model_name=model, scan_layers=False, **packing)
+        self.assertTrue(config.packing, msg=f"{model} {packing}")
 
 
 if __name__ == "__main__":
